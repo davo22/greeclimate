@@ -591,6 +591,35 @@ async def test_send_temperature_celsius(temperature, cipher, send):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("temperature", [18.5, 19.5, 21.5])
+async def test_send_temperature_celsius_half_step(temperature, cipher, send):
+    """Check that half-degree Celsius steps round-trip via the TemRec bit."""
+    state = get_mock_state()
+    state["SetTem"] = int(temperature)
+    state["TemRec"] = 1
+    state["TemSen"] = int(temperature) + 40
+    device = await generate_device_mock_async()
+    device.temperature_units = TemperatureUnits.C
+    device.target_temperature = temperature
+
+    assert device.get_property(Props.TEMP_SET) == int(temperature)
+    assert device.get_property(Props.TEMP_BIT) == 1
+
+    await device.push_state_update()
+    assert send.call_count == 1
+
+    def fake_send(*args, **kwargs):
+        device.handle_state_update(**state)
+    send.side_effect = fake_send
+
+    await device.update_state()
+
+    assert device.target_temperature == temperature
+    # The sensed temperature is not affected by the setpoint's half-degree bit.
+    assert device.current_temperature == int(temperature)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "temperature", [60, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 86]
 )
