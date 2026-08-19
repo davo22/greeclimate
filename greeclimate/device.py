@@ -392,9 +392,11 @@ class Device(DeviceProtocol2, Taskable):
     def mode(self, value: int):
         self.set_property(Props.MODE, int(value))
 
-    def _convert_to_units(self, value, bit):
+    def _convert_to_units(self, value, bit, half_step=False):
         if self.temperature_units != TemperatureUnits.F.value:
-            return value
+            # TemRec doubles as a 0.5C offset bit on the target temperature setpoint;
+            # it does not apply to the sensed temperature, so only honor it there.
+            return value + (0.5 if half_step and bit == 1 else 0)
 
         if value < TEMP_MIN_TABLE or value > TEMP_MAX_TABLE:
             raise ValueError(f"Specified temperature {value} is out of range.")
@@ -409,15 +411,15 @@ class Device(DeviceProtocol2, Taskable):
         return f["f"]
 
     @property
-    def target_temperature(self) -> Optional[int]:
+    def target_temperature(self) -> Optional[float]:
         temset = self.get_property(Props.TEMP_SET)
         temrec = self.get_property(Props.TEMP_BIT)
         if temset is None or temrec is None:
             return None
-        return self._convert_to_units(temset, temrec)
+        return self._convert_to_units(temset, temrec, half_step=True)
 
     @target_temperature.setter
-    def target_temperature(self, value: int):
+    def target_temperature(self, value: float):
         def validate(val):
             if val > TEMP_MAX or val < TEMP_MIN:
                 raise ValueError(f"Specified temperature {val} is out of range.")
@@ -428,8 +430,9 @@ class Device(DeviceProtocol2, Taskable):
             self.set_property(Props.TEMP_SET, rec["temSet"])
             self.set_property(Props.TEMP_BIT, rec["temRec"])
         else:
-            validate(value)
+            validate(int(value))
             self.set_property(Props.TEMP_SET, int(value))
+            self.set_property(Props.TEMP_BIT, 1 if (value % 1) >= 0.5 else 0)
 
     @property
     def temperature_units(self) -> Optional[int]:
