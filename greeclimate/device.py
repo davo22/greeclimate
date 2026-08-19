@@ -29,6 +29,12 @@ class Props(enum.Enum):
     TEMP_SENSOR = "TemSen"
     TEMP_UNIT = "TemUn"
     TEMP_BIT = "TemRec"
+    # Half-degree Celsius setpoint support. TemRec is not a reliable indicator of
+    # this (it's shared with the F<->C conversion table and can be stale); the
+    # authoritative value is TEMP_DECI, gated by TEMP_HALF_ENABLED.
+    TEMP_HALF_ENABLED = "HalfTemEn"
+    TEMP_DECI = "SetDeciTem"
+    TEMP_HALF_DEGREE = "Add0.5"
     FAN_SPEED = "WdSpd"
     FRESH_AIR = "Air"
     XFAN = "Blo"
@@ -325,11 +331,24 @@ class Device(DeviceProtocol2, Taskable):
             value = self._properties.get(name)
             self._logger.debug("Sending remote state update %s -> %s", name, value)
             props[name] = value
-            if name == Props.TEMP_SET.value:
-                props[Props.TEMP_BIT.value] = self._properties.get(Props.TEMP_BIT.value)
-                props[Props.TEMP_UNIT.value] = self._properties.get(
-                    Props.TEMP_UNIT.value
-                )
+
+        # Temperature-related properties must travel together: the unit only applies
+        # a setpoint change when SetTem is present in the command, so if e.g. only
+        # TemRec or SetDeciTem changed (a 0.5C step where the whole-degree part is
+        # unchanged), SetTem would otherwise be silently dropped and the device
+        # ignores the update.
+        temp_group = (
+            Props.TEMP_SET.value,
+            Props.TEMP_BIT.value,
+            Props.TEMP_DECI.value,
+            Props.TEMP_HALF_DEGREE.value,
+        )
+        if any(name in self._dirty for name in temp_group):
+            for name in temp_group:
+                value = self._properties.get(name)
+                if value is not None:
+                    props[name] = value
+            props[Props.TEMP_UNIT.value] = self._properties.get(Props.TEMP_UNIT.value)
 
         try:
             await self.send(self.create_command_message(self.device_info, **props))
@@ -392,11 +411,9 @@ class Device(DeviceProtocol2, Taskable):
     def mode(self, value: int):
         self.set_property(Props.MODE, int(value))
 
-    def _convert_to_units(self, value, bit, half_step=False):
+    def _convert_to_units(self, value, bit):
         if self.temperature_units != TemperatureUnits.F.value:
-            # TemRec doubles as a 0.5C offset bit on the target temperature setpoint;
-            # it does not apply to the sensed temperature, so only honor it there.
-            return value + (0.5 if half_step and bit == 1 else 0)
+            return value
 
         if value < TEMP_MIN_TABLE or value > TEMP_MAX_TABLE:
             raise ValueError(f"Specified temperature {value} is out of range.")
@@ -416,7 +433,11 @@ class Device(DeviceProtocol2, Taskable):
         temrec = self.get_property(Props.TEMP_BIT)
         if temset is None or temrec is None:
             return None
-        return self._convert_to_units(temset, temrec, half_step=True)
+        if self.temperature_units == TemperatureUnits.C.value:
+            deci = self.get_property(Props.TEMP_DECI)
+            if deci is not None:
+                return deci / 10
+        return self._convert_to_units(temset, temrec)
 
     @target_temperature.setter
     def target_temperature(self, value: float):
@@ -432,7 +453,14 @@ class Device(DeviceProtocol2, Taskable):
         else:
             validate(int(value))
             self.set_property(Props.TEMP_SET, int(value))
-            self.set_property(Props.TEMP_BIT, 1 if (value % 1) >= 0.5 else 0)
+            # Only devices that have reported HalfTemEn support decimal setpoints;
+            # SetDeciTem (tenths of a degree) is the field the unit actually reads
+            # for display/control, TemRec alone is not enough (see history for why).
+            if self.get_property(Props.TEMP_HALF_ENABLED) == 1:
+                half = 1 if (value % 1) >= 0.5 else 0
+                self.set_property(Props.TEMP_BIT, half)
+                self.set_property(Props.TEMP_HALF_DEGREE, half)
+                self.set_property(Props.TEMP_DECI, round(value * 10))
 
     @property
     def temperature_units(self) -> Optional[int]:

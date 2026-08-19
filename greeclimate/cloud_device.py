@@ -216,23 +216,32 @@ class CloudDevice(Device):
             })
             del remaining[Props.MODE.value]
         
-        # Temperature with bit/unit
-        if Props.TEMP_SET.value in remaining:
-            temp_opt = [Props.TEMP_SET.value]
-            temp_p = [remaining[Props.TEMP_SET.value]]
-            
-            if Props.TEMP_BIT.value in remaining:
-                temp_opt.append(Props.TEMP_BIT.value)
-                temp_p.append(remaining[Props.TEMP_BIT.value])
-                del remaining[Props.TEMP_BIT.value]
-            
+        # Temperature-related properties must always travel together in one
+        # command: a 0.5C step where the whole-degree part is unchanged only
+        # marks TEMP_BIT/TEMP_DECI/TEMP_HALF_DEGREE dirty, and the device
+        # ignores those without SetTem present alongside them.
+        temp_group = (
+            Props.TEMP_SET.value,
+            Props.TEMP_BIT.value,
+            Props.TEMP_DECI.value,
+            Props.TEMP_HALF_DEGREE.value,
+        )
+        if any(p in remaining for p in temp_group):
+            temp_opt = []
+            temp_p = []
+            for p in temp_group:
+                value = self._properties.get(p)
+                if value is not None:
+                    temp_opt.append(p)
+                    temp_p.append(value)
+                remaining.pop(p, None)
+
             if Props.TEMP_UNIT.value in remaining:
                 temp_opt.append(Props.TEMP_UNIT.value)
                 temp_p.append(remaining[Props.TEMP_UNIT.value])
                 del remaining[Props.TEMP_UNIT.value]
-            
+
             commands.append({'opt': temp_opt, 'p': temp_p})
-            del remaining[Props.TEMP_SET.value]
         
         # Save Power for last
         has_power = Props.POWER.value in remaining
