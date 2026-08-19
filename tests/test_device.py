@@ -45,6 +45,9 @@ def get_mock_state():
         "StHt": 0,
         "SvSt": 0,
         "TemRec": 0,
+        "HalfTemEn": 0,
+        "SetDeciTem": 250,
+        "Add0.5": 0,
         "HeatCoolType": 0,
         "hid": "362001000762+U-CS532AE(LT)V3.31.bin",
         "Dmod": 0,
@@ -397,6 +400,9 @@ async def test_set_properties(cipher, send):
             Props.TEMP_SENSOR,
             Props.TEMP_SET,
             Props.TEMP_BIT,
+            Props.TEMP_HALF_ENABLED,
+            Props.TEMP_DECI,
+            Props.TEMP_HALF_DEGREE,
             Props.UNKNOWN_HEATCOOLTYPE,
             Props.HUM_SENSOR,
             Props.DEHUMIDIFIER_MODE,
@@ -593,17 +599,22 @@ async def test_send_temperature_celsius(temperature, cipher, send):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("temperature", [18.5, 19.5, 21.5])
 async def test_send_temperature_celsius_half_step(temperature, cipher, send):
-    """Check that half-degree Celsius steps round-trip via the TemRec bit."""
+    """Half-degree Celsius steps round-trip via SetDeciTem on devices that have
+    reported HalfTemEn=1. TemRec is also set (the physical panel does the same),
+    but SetDeciTem is authoritative -- see history for why TemRec alone isn't."""
     state = get_mock_state()
     state["SetTem"] = int(temperature)
     state["TemRec"] = 1
+    state["SetDeciTem"] = round(temperature * 10)
     state["TemSen"] = int(temperature) + 40
     device = await generate_device_mock_async()
     device.temperature_units = TemperatureUnits.C
+    device.handle_state_update(**{"HalfTemEn": 1})
+
     device.target_temperature = temperature
 
     assert device.get_property(Props.TEMP_SET) == int(temperature)
-    assert device.get_property(Props.TEMP_BIT) == 1
+    assert device.get_property(Props.TEMP_DECI) == round(temperature * 10)
 
     await device.push_state_update()
     assert send.call_count == 1
@@ -615,8 +626,33 @@ async def test_send_temperature_celsius_half_step(temperature, cipher, send):
     await device.update_state()
 
     assert device.target_temperature == temperature
-    # The sensed temperature is not affected by the setpoint's half-degree bit.
+    # The sensed temperature is not affected by the setpoint's decimal precision.
     assert device.current_temperature == int(temperature)
+
+
+@pytest.mark.asyncio
+async def test_send_temperature_celsius_half_step_includes_settem(cipher, send):
+    """SetTem must be sent whenever SetDeciTem/TemRec change, even if SetTem's own
+    value didn't change -- otherwise the device receives those without a setpoint
+    to apply them to and silently ignores the update."""
+    device = await generate_device_mock_async()
+    device.temperature_units = TemperatureUnits.C
+    device.handle_state_update(**{"HalfTemEn": 1})
+    device.target_temperature = 21
+
+    await device.push_state_update()
+    send.reset_mock()
+
+    # Bump only the half-degree part; the whole-degree part (21) stays the same.
+    device.target_temperature = 21.5
+    await device.push_state_update()
+
+    assert send.call_count == 1
+    sent_pack = send.call_args[0][0]["pack"]
+    sent = dict(zip(sent_pack["opt"], sent_pack["p"]))
+    assert sent.get("SetTem") == 21
+    assert sent.get("SetDeciTem") == 215
+    assert sent.get("TemRec") == 1
 
 
 @pytest.mark.asyncio
