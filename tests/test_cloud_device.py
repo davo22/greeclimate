@@ -1,9 +1,9 @@
 """Tests for CloudDevice, in particular its command-batching logic."""
 from unittest.mock import MagicMock
 
-from greeclimate.cloud_device import CloudDevice
-from greeclimate.device import Props, TemperatureUnits
-from greeclimate.deviceinfo import DeviceInfo
+from greeclimate_davo22.cloud_device import CloudDevice
+from greeclimate_davo22.device import Props, TemperatureUnits
+from greeclimate_davo22.deviceinfo import DeviceInfo
 
 
 def make_cloud_device():

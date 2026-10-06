@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from greeclimate.mqtt_client import GreeMqttClient, MqttDeviceMessage
+from greeclimate_davo22.mqtt_client import GreeMqttClient, MqttDeviceMessage
 
 
 class TestMqttClient:

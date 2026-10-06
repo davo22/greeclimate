@@ -7,11 +7,11 @@ from asyncio import AbstractEventLoop
 from enum import IntEnum, unique
 from typing import Union, Optional, Any
 
-from greeclimate.cipher import CipherV1, CipherV2
-from greeclimate.deviceinfo import DeviceInfo
-from greeclimate.exceptions import DeviceNotBoundError, DeviceTimeoutError
-from greeclimate.network import DeviceProtocol2
-from greeclimate.taskable import Taskable
+from greeclimate_davo22.cipher import CipherV1, CipherV2
+from greeclimate_davo22.deviceinfo import DeviceInfo
+from greeclimate_davo22.exceptions import DeviceNotBoundError, DeviceTimeoutError
+from greeclimate_davo22.network import DeviceProtocol2
+from greeclimate_davo22.taskable import Taskable
 
 
 class Props(enum.Enum):

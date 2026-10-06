@@ -3,9 +3,9 @@ import enum
 
 import pytest
 
-from greeclimate.cipher import CipherV1
-from greeclimate.device import Device, DeviceInfo, Props, TemperatureUnits
-from greeclimate.exceptions import DeviceNotBoundError, DeviceTimeoutError
+from greeclimate_davo22.cipher import CipherV1
+from greeclimate_davo22.device import Device, DeviceInfo, Props, TemperatureUnits
+from greeclimate_davo22.exceptions import DeviceNotBoundError, DeviceTimeoutError
 
 
 class FakeProps(enum.Enum):

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import base64
 import json
 
-from greeclimate.cloud_api import (
+from greeclimate_davo22.cloud_api import (
     GreeCloudApi,
     CloudDeviceInfo,
     CloudHome,

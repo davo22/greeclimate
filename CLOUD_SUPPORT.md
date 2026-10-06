@@ -20,7 +20,7 @@ Gree manufactures devices that only work through their cloud service and do not 
 The cloud implementation follows clean architecture principles:
 
 ```
-greeclimate/
+greeclimate_davo22/
 ├── cloud_api.py          # Gree Cloud REST API client
 ├── mqtt_client.py        # MQTT broker communication
 ├── cloud_device.py       # Cloud device implementation
@@ -43,7 +43,7 @@ greeclimate/
 
 ```python
 import asyncio
-from greeclimate.cloud_discovery import CloudDiscovery
+from greeclimate_davo22.cloud_discovery import CloudDiscovery
 
 async def main():
     # Create discovery instance
@@ -89,10 +89,10 @@ asyncio.run(main())
 ### Advanced Example with Manual Setup
 
 ```python
-from greeclimate.cloud_api import GreeCloudApi
-from greeclimate.mqtt_client import GreeMqttClient
-from greeclimate.cloud_device import CloudDevice
-from greeclimate.deviceinfo import DeviceInfo
+from greeclimate_davo22.cloud_api import GreeCloudApi
+from greeclimate_davo22.mqtt_client import GreeMqttClient
+from greeclimate_davo22.cloud_device import CloudDevice
+from greeclimate_davo22.deviceinfo import DeviceInfo
 
 # Step 1: Authenticate with Cloud API
 api = GreeCloudApi.for_server('Europe', 'email@example.com', 'password')

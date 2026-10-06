@@ -10,7 +10,7 @@ This example shows how to:
 
 import asyncio
 import logging
-from greeclimate.cloud_discovery import CloudDiscovery
+from greeclimate_davo22.cloud_discovery import CloudDiscovery
 
 # Setup logging
 logging.basicConfig(

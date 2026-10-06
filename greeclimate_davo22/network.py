@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Tuple, Union
 
-from greeclimate.cipher import CipherBase
-from greeclimate.deviceinfo import DeviceInfo
+from greeclimate_davo22.cipher import CipherBase
+from greeclimate_davo22.deviceinfo import DeviceInfo
 
 NETWORK_TIMEOUT = 10
 _LOGGER = logging.getLogger(__name__)

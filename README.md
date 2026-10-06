@@ -4,6 +4,13 @@
 
 Discover, connect and control Gree based mini-split systems.
 
+> **This is a fork.** It adds Gree Cloud (MQTT) support for devices that cannot be reached on the
+> local network, and it is published as **`greeclimate-davo22`**, importing as **`greeclimate_davo22`**.
+> The upstream project at [cmroche/greeclimate](https://github.com/cmroche/greeclimate) keeps the
+> `greeclimate` name on PyPI. The names differ on purpose: Home Assistant's built-in `gree`
+> integration installs upstream `greeclimate`, and two distributions writing to the same
+> `site-packages/greeclimate/` directory would overwrite each other file by file.
+
 **greeclimate** is a ***fully async*** Python3 based package for controlling Gree based ACs and heat pumps. Gree is a common brand for mini-split systems and is licensed and resold under many product names. This module should work for any device that also works with the Gree+ app, but has been tested on
 
 - Proklima mini-splits units
@@ -26,7 +33,7 @@ See **[CLOUD_SUPPORT.md](CLOUD_SUPPORT.md)** for detailed documentation and exam
 
 **Quick Example:**
 ```python
-from greeclimate.cloud_discovery import CloudDiscovery
+from greeclimate_davo22.cloud_discovery import CloudDiscovery
 
 discovery = CloudDiscovery('email@example.com', 'password', 'Europe')
 devices = await discovery.scan()
@@ -46,8 +53,8 @@ await device.push_state_update()
 
 ## Getting the package
 
-The easiest way to grab **greeclimate** is through PyPI
-`pip3 install greeclimate`
+This fork is not on PyPI; install it from git
+`pip3 install git+https://github.com/davo22/greeclimate.git`
 
 ## Use Gree Climate
 
@@ -124,7 +131,7 @@ await device.push_state_update()
 For devices that only work through Gree Cloud (don't respond to local discovery):
 
 ```python
-from greeclimate.cloud_discovery import CloudDiscovery
+from greeclimate_davo22.cloud_discovery import CloudDiscovery
 
 # Discover cloud devices
 discovery = CloudDiscovery(
