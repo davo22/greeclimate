@@ -3,7 +3,7 @@ from socket import SOCK_DGRAM
 from typing import Tuple, Union
 from unittest.mock import Mock
 
-from greeclimate.cipher import CipherV1, CipherBase
+from greeclimate_davo22.cipher import CipherV1, CipherBase
 
 DEFAULT_TIMEOUT = 1
 DISCOVERY_REQUEST = {"t": "scan"}

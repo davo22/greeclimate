@@ -2,7 +2,7 @@ from unittest.mock import patch
 
 import pytest
 
-from greeclimate.device import Props, Device
+from greeclimate_davo22.device import Props, Device
 
 
 @pytest.mark.asyncio

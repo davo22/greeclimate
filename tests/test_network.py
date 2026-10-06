@@ -6,8 +6,8 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from greeclimate.deviceinfo import DeviceInfo
-from greeclimate.network import (
+from greeclimate_davo22.deviceinfo import DeviceInfo
+from greeclimate_davo22.network import (
     BroadcastListenerProtocol,
     DeviceProtocolBase2,
     IPAddr,

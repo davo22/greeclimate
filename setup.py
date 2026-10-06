@@ -7,15 +7,15 @@ with open("requirements.txt") as f:
     requirements = f.read().splitlines()
 
 setuptools.setup(
-    name="greeclimate",
+    name="greeclimate-davo22",
     python_requires=">=3.8",
     install_requires=requirements,
     author="Clifford Roche",
     author_email="",
-    description="Discover, connect and control Gree based minisplit systems",
+    description="Fork of greeclimate adding Gree Cloud (MQTT) support, for cloud-only devices",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/cmroche/greeclimate",
+    url="https://github.com/davo22/greeclimate",
     packages=setuptools.find_packages(exclude=["tests"]),
     classifiers=[
         "Programming Language :: Python :: 3",

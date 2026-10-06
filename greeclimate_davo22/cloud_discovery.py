@@ -8,11 +8,11 @@ import logging
 from typing import List, Optional
 from asyncio.events import AbstractEventLoop
 
-from greeclimate.cloud_api import GreeCloudApi, CloudDeviceInfo, GREE_CLOUD_SERVERS
-from greeclimate.mqtt_client import GreeMqttClient
-from greeclimate.cloud_device import CloudDevice
-from greeclimate.deviceinfo import DeviceInfo
-from greeclimate.taskable import Taskable
+from greeclimate_davo22.cloud_api import GreeCloudApi, CloudDeviceInfo, GREE_CLOUD_SERVERS
+from greeclimate_davo22.mqtt_client import GreeMqttClient
+from greeclimate_davo22.cloud_device import CloudDevice
+from greeclimate_davo22.deviceinfo import DeviceInfo
+from greeclimate_davo22.taskable import Taskable
 
 _LOGGER = logging.getLogger(__name__)
 

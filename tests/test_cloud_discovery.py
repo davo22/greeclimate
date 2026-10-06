@@ -3,8 +3,8 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from greeclimate.cloud_discovery import CloudDiscovery
-from greeclimate.cloud_api import CloudDeviceInfo, CloudHome, CloudCredentials
+from greeclimate_davo22.cloud_discovery import CloudDiscovery
+from greeclimate_davo22.cloud_api import CloudDeviceInfo, CloudHome, CloudCredentials
 
 
 class TestCloudDiscovery:
@@ -39,8 +39,8 @@ class TestCloudDiscovery:
         """Test authentication"""
         mock_credentials = CloudCredentials(user_id=12345, token='test_token')
 
-        with patch('greeclimate.cloud_discovery.GreeCloudApi') as MockApi, \
-             patch('greeclimate.cloud_discovery.GreeMqttClient') as MockMqtt:
+        with patch('greeclimate_davo22.cloud_discovery.GreeCloudApi') as MockApi, \
+             patch('greeclimate_davo22.cloud_discovery.GreeMqttClient') as MockMqtt:
 
             mock_api = MagicMock()
             mock_api.login = AsyncMock(return_value=mock_credentials)
@@ -77,8 +77,8 @@ class TestCloudDiscovery:
             )
         ]
 
-        with patch('greeclimate.cloud_discovery.GreeCloudApi') as MockApi, \
-             patch('greeclimate.cloud_discovery.GreeMqttClient') as MockMqtt:
+        with patch('greeclimate_davo22.cloud_discovery.GreeCloudApi') as MockApi, \
+             patch('greeclimate_davo22.cloud_discovery.GreeMqttClient') as MockMqtt:
 
             mock_api = MagicMock()
             mock_api.login = AsyncMock(return_value=mock_credentials)
@@ -101,8 +101,8 @@ class TestCloudDiscovery:
         """Test scan authenticates automatically"""
         mock_credentials = CloudCredentials(user_id=12345, token='test_token')
 
-        with patch('greeclimate.cloud_discovery.GreeCloudApi') as MockApi, \
-             patch('greeclimate.cloud_discovery.GreeMqttClient') as MockMqtt:
+        with patch('greeclimate_davo22.cloud_discovery.GreeCloudApi') as MockApi, \
+             patch('greeclimate_davo22.cloud_discovery.GreeMqttClient') as MockMqtt:
 
             mock_api = MagicMock()
             mock_api.login = AsyncMock(return_value=mock_credentials)

@@ -7,11 +7,11 @@ import asyncio
 import logging
 from typing import Optional, Dict, Any, List
 
-from greeclimate.cipher import CipherV1, CipherV2
-from greeclimate.device import Device, Props
-from greeclimate.deviceinfo import DeviceInfo
-from greeclimate.mqtt_client import GreeMqttClient, MqttDeviceMessage
-from greeclimate.taskable import Taskable
+from greeclimate_davo22.cipher import CipherV1, CipherV2
+from greeclimate_davo22.device import Device, Props
+from greeclimate_davo22.deviceinfo import DeviceInfo
+from greeclimate_davo22.mqtt_client import GreeMqttClient, MqttDeviceMessage
+from greeclimate_davo22.taskable import Taskable
 
 _LOGGER = logging.getLogger(__name__)
 

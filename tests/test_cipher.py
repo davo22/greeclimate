@@ -2,7 +2,7 @@ import base64
 
 import pytest
 
-from greeclimate.cipher import CipherV1, CipherV2, CipherBase
+from greeclimate_davo22.cipher import CipherV1, CipherV2, CipherBase
 
 
 @pytest.fixture
