@@ -36,7 +36,7 @@ jobs:
           flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
       - name: Test with unittest
         run: |
-          pytest --cov-report=xml --cov=greeclimate tests/
+          pytest --cov-report=xml --cov=greeclimate_davo22 tests/
       - uses: codecov/codecov-action@v4
         with:
           file: ./coverage.xml
