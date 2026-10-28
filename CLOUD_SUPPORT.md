@@ -22,16 +22,35 @@ The cloud implementation follows clean architecture principles:
 ```
 greeclimate_davo22/
 ├── cloud_api.py          # Gree Cloud REST API client
-├── mqtt_client.py        # MQTT broker communication
+├── mqtt_client.py        # MQTT broker communication (modules with protocol >= 3.2)
+├── cloud_gateway.py      # Legacy TLS gateway (modules with protocol < 3.2)
 ├── cloud_device.py       # Cloud device implementation
 └── cloud_discovery.py    # Cloud device discovery
 ```
+
+### Two transports
+
+The Gree+ app reaches a module in one of two ways, depending on the protocol
+version in its cloud record (`ver`, e.g. `V3.5.0`):
+
+- **`ver >= 3.2` → MQTT.** Requests go to `request/<mac>`, replies arrive on
+  `response/<mac>/#` and `status/<mac>/#`.
+- **`ver < 3.2` → legacy gateway.** These modules never connect to the MQTT
+  broker. `/App/QueryOnline` returns the gateway each device is attached to
+  (`svr`, `isSSL`); the client opens a TLS connection to it, sends one
+  newline-terminated envelope with the inner pack AES-128-ECB-encrypted under
+  the device key, reads one line back and closes. See `cloud_gateway.py`.
+
+`CloudDevice` picks the transport automatically from `device_info.version`
+when it is given a shared `GreeCloudGateway`; without one it always uses MQTT
+(the behaviour of releases before 2.4.0). Pass `transport="mqtt"` or
+`transport="gateway"` to force one.
 
 ### Key Differences from Local Devices
 
 | Feature | Local Device | Cloud Device |
 |---------|--------------|--------------|
-| Protocol | UDP | MQTT over TLS |
+| Protocol | UDP | MQTT over TLS, or TLS gateway for pre-3.2 modules |
 | Discovery | Broadcast | Cloud API |
 | Temperature | Offset +40 | Raw values |
 | Commands | Batch | Sequential |
@@ -171,14 +190,20 @@ await mqtt.disconnect()
 Cloud-based device controller (extends Device).
 
 ```python
-device = CloudDevice(mqtt_client, device_info, device_key)
+gateway = GreeCloudGateway(api)  # shared by all devices of the account
+device = CloudDevice(mqtt_client, device_info, device_key, gateway=gateway)
 await device.bind()
-await device.update_state()
+await device.update_state()      # raises asyncio.TimeoutError if the device stays silent
 device.power = True
 device.target_temperature = 24
 await device.push_state_update()
 await device.close()
 ```
+
+`device.transport` tells you which path was chosen (`"mqtt"` or `"gateway"`).
+Since 2.4.0 `update_state()` raises `asyncio.TimeoutError` (or its subclass
+`DeviceOfflineError`) instead of logging and returning, so callers can count
+failures and mark the device unavailable.
 
 ## Important Notes
 
