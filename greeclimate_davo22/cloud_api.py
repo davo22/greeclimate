@@ -28,6 +28,19 @@ class CloudDeviceInfo:
     model: Optional[str] = None
     version: Optional[str] = None
     online: bool = True
+    # Gateway/module MAC for indoor units behind a commercial controller
+    # (``pmac`` in the cloud record); empty on standalone modules.
+    parent_mac: Optional[str] = None
+    # Device type id (``mid``), e.g. "10001" for a split AC.
+    mid: Optional[str] = None
+
+
+@dataclass
+class CloudDeviceServer:
+    """Gateway a (pre-MQTT) device is attached to, from ``QueryOnline``"""
+    host: str
+    port: int
+    ssl: bool = True
 
 
 @dataclass
@@ -127,8 +140,13 @@ class GreeCloudApi:
         # Generate verification code
         vc = self._md5(f"{self.APP_ID}_{self.APP_HASH}_{t}_{r}")
 
-        # Generate data verification code
-        props = [str(payload[p]) for p in hash_props]
+        # Generate data verification code. List values (e.g. the MAC list of
+        # QueryOnline) are signed as their items joined with '_'.
+        props = [
+            '_'.join(str(v) for v in payload[p]) if isinstance(payload[p], (list, tuple))
+            else str(payload[p])
+            for p in hash_props
+        ]
         dat_vc = self._md5(f"{self.APP_HASH}_{'_'.join(props)}")
 
         return {
@@ -317,18 +335,76 @@ class GreeCloudApi:
         devices = []
         for room in data['rooms']:
             for dev in room['devs']:
+                # Log the record for diagnostics, minus the encryption key.
+                _LOGGER.debug(
+                    "Cloud device record: %s",
+                    {k: v for k, v in dev.items() if k != 'key'},
+                )
                 device = CloudDeviceInfo(
                     name=dev['name'].strip(),
                     mac=dev['mac'].strip(),
                     key=dev['key'].strip(),
                     model=dev.get('model', '').strip() if dev.get('model') else None,
                     version=dev.get('ver', '').strip() if dev.get('ver') else None,
-                    online=bool(dev.get('online', 1))
+                    online=bool(dev.get('online', 1)),
+                    parent_mac=(dev.get('pmac') or '').strip() or None,
+                    mid=str(dev['mid']).strip() if dev.get('mid') not in (None, '') else None,
                 )
                 devices.append(device)
 
         _LOGGER.info(f"Found {len(devices)} devices in home {home_id}")
         return devices
+
+    async def query_online(self, macs: List[str]) -> Dict[str, CloudDeviceServer]:
+        """Ask the cloud which devices are online and which gateway serves them
+
+        Used for modules with protocol version < 3.2, which the Gree+ app does
+        not reach over MQTT but through a per-device TLS gateway (see
+        ``cloud_gateway.py``).
+
+        Args:
+            macs: Device MAC addresses to query
+
+        Returns:
+            Mapping of MAC -> CloudDeviceServer for the devices that are online.
+            Offline devices are simply absent.
+        """
+        from datetime import timezone
+
+        if not self.user_id or not self.token:
+            raise Exception('Not logged in. Call login() first.')
+
+        date = datetime.now(timezone.utc)
+
+        body = json.dumps(self._prepare_body(
+            {
+                'token': self.token,
+                'uid': self.user_id,
+                'macs': list(macs),
+            },
+            date,
+            ['token', 'uid', 'macs']
+        ))
+
+        encrypted_response = await self._send_request('/App/QueryOnline', body)
+        decrypted = self._decrypt(base64.b64decode(encrypted_response))
+        data = json.loads(decrypted)
+
+        if 'r' in data and data['r'] != 200:
+            raise Exception(f"QueryOnline failed: {data.get('msg', data)}")
+
+        servers: Dict[str, CloudDeviceServer] = {}
+        for entry in data.get('online', []) or []:
+            svr = entry.get('svr')
+            if not svr or ':' not in svr:
+                continue
+            host, port = svr.rsplit(':', 1)
+            servers[entry['mac']] = CloudDeviceServer(
+                host=host, port=int(port), ssl=bool(entry.get('isSSL', False))
+            )
+
+        _LOGGER.debug("QueryOnline: %d of %d devices online", len(servers), len(macs))
+        return servers
 
     async def close(self):
         """Close the HTTP session"""

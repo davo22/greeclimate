@@ -20,12 +20,19 @@ _If you have tested and know of others systems that work, please fork and submit
 
 ## ⭐ New: Cloud-Only Device Support
 
-This fork adds support for **cloud-only devices** that don't respond to local UDP discovery. These devices only work through Gree Cloud and MQTT.
+This fork adds support for **cloud-only devices** that don't respond to local UDP discovery. These devices only work through the Gree cloud: over MQTT for modules with protocol `V3.2` and newer, or through the legacy TLS device gateway for older modules (`V2.x`, `V1.x`), which never join the MQTT broker. The transport is picked per device from its cloud record.
+
+**Fork notice (GPL-3.0 §5a):** this is a modified version of
+[cmroche/greeclimate](https://github.com/cmroche/greeclimate), maintained by
+[davo22](https://github.com/davo22) since 2026-02 and published as the
+`greeclimate-davo22` distribution / `greeclimate_davo22` module so it can be
+installed next to the original. Copyright and the GPL-3.0 licence of the
+original are unchanged; see `LICENSE.txt`.
 
 **Features:**
 - 🌐 Authenticate with Gree Cloud API
 - 🔍 Discover cloud-only devices
-- 📡 Control via MQTT broker
+- 📡 Control via MQTT broker (protocol >= 3.2) or the legacy TLS gateway (older modules)
 - 🌍 Support for all regions (Europe, US, Asia, etc.)
 - 🔒 Both CipherV1 (ECB) and CipherV2 (GCM)
 
