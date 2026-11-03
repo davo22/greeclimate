@@ -1,4 +1,5 @@
-![Python package](https://github.com/cmroche/greeclimate/workflows/Python%20package/badge.svg)
+![Python package](https://github.com/davo22/greeclimate/actions/workflows/python-package.yml/badge.svg)
+[![PyPI](https://img.shields.io/pypi/v/greeclimate-davo22.svg)](https://pypi.org/project/greeclimate-davo22/)
 
 ## Gree Climate
 
@@ -60,8 +61,11 @@ await device.push_state_update()
 
 ## Getting the package
 
-This fork is not on PyPI; install it from git
-`pip3 install git+https://github.com/davo22/greeclimate.git`
+`pip3 install greeclimate-davo22`
+
+Releases are published to [PyPI](https://pypi.org/project/greeclimate-davo22/) from GitHub
+releases via Trusted Publishing (`.github/workflows/publish.yml`). To install straight from git
+instead: `pip3 install git+https://github.com/davo22/greeclimate.git@<tag>`
 
 ## Use Gree Climate
 

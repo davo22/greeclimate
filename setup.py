@@ -8,7 +8,7 @@ with open("requirements.txt") as f:
 
 setuptools.setup(
     name="greeclimate-davo22",
-    python_requires=">=3.8",
+    python_requires=">=3.10",
     install_requires=requirements,
     author="Clifford Roche",
     author_email="",
