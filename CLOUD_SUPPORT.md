@@ -12,7 +12,7 @@ Gree manufactures devices that only work through their cloud service and do not 
 - **Device Discovery**: Retrieve list of cloud devices with encryption keys
 - **MQTT Communication**: Control devices via Gree Cloud MQTT broker
 - **Multiple Regions**: Support for all Gree Cloud regions (Europe, US, Asia, etc.)
-- **Parent/Child Devices**: Support for commercial units with parent/child hierarchy
+- **Modules and indoor units**: commercial/VRF units addressed through their module (`pmac`), with per-unit reply routing and automatic addressing fallback
 - **Both Cipher Versions**: Support for CipherV1 (ECB) and CipherV2 (GCM)
 
 ## Architecture
@@ -205,6 +205,24 @@ Since 2.4.0 `update_state()` raises `asyncio.TimeoutError` (or its subclass
 `DeviceOfflineError`) instead of logging and returning, so callers can count
 failures and mark the device unavailable.
 
+#### Request/response primitives (2.5.0)
+
+For callers that need the acknowledgement itself, or want to read columns
+without touching the device state:
+
+```python
+# One "cmd" pack; returns the decrypted reply, e.g. {"t": "res", "r": 200, "opt": [...], "p": [...]}
+reply = await device.send_command(["HeWatOutTemSet"], [45], strict_ack=True)
+
+# One "status" pack for arbitrary columns; returns {col: value}, state untouched
+data = await device.request_status(["Pow", "Mod", "HeWatOutTemSet"])
+```
+
+`send_command(..., strict_ack=False)` (the default, used by
+`push_state_update()`) tolerates a missing acknowledgement and returns `None`;
+with `strict_ack=True` a missing reply raises `asyncio.TimeoutError`. Both work
+over MQTT and the legacy gateway.
+
 ## Important Notes
 
 ### Temperature Handling
@@ -232,18 +250,44 @@ device.target_temperature = 24
 await device.push_state_update()
 ```
 
-### Parent/Child Devices and Duplicate Filtering
+### Modules, indoor units and duplicate records
 
-Commercial units may have parent/child hierarchy:
+Commercial systems put one or more indoor units behind a Wi-Fi module. The
+cloud lists the module itself (`pmac` empty, `mid` 60) and one record per unit,
+each carrying the module's MAC as `pmac`:
 
-- **Parent MAC**: Base address (e.g., `c03937a616ab`)
-- **Child MAC**: Parent + suffix (e.g., `c03937a616ab00`)
-- **Topics**: Use parent MAC
-- **Target (tcid)**: Use child MAC
+```
+mac=c03937a616ab00  pmac=c03937a616ab  mid=6400   (single-head module)
+mac=7b65b424500000  pmac=9424b8b368bd  mid=6000   (one of four heads, #6)
+mac=9424b8b368bd    pmac=              mid=60     (the module record)
+```
 
-This is handled automatically by `CloudDevice`.
+Pass the record's `pmac` to `CloudDevice(..., parent_mac=...)`. The unit is
+then subscribed and published through the module topic. Without `pmac` the
+module is guessed by stripping a trailing `00`, which only works for
+single-head modules whose unit id is the module MAC plus `00`.
 
-**Important**: Cloud API sometimes returns duplicate devices with the same encryption key but different MAC addresses (one normal, one with '00' appended). The device **without** '00' suffix doesn't respond to commands. The `CloudDiscovery.scan()` method automatically filters out these non-responsive duplicates, keeping only the device with '00' suffix that actually responds to commands.
+Two addressing modes exist for units behind a module; `device.addressing`
+tells which one is active:
+
+- `"tcid"` (default): envelope `tcid` = unit id, plain pack. Verified on a
+  single-head module.
+- `"pack"`: envelope `tcid` = module, unit named inside the encrypted pack as
+  `"mac"`. This is how Gree+ drives multi-head/VRF systems (#33). Used
+  automatically when a status request under `"tcid"` gets no answer, and kept
+  from then on.
+
+All units behind one module share its `response/`/`status/` topics, so every
+unit receives every reply. Replies that name another unit (`sub` or `mac` in
+the decrypted pack) are ignored. Values are normalised on the way in: `""`
+(unsupported field) is dropped instead of clobbering a good value, numeric
+strings become numbers, and `InTem` (room temperature on commercial units,
+same +40 offset) stands in for a missing `TemSen`.
+
+**Duplicate filtering.** `get_all_devices()` drops the module record whenever
+another record names it as `pmac` — it is the gateway, not a controllable
+unit. For records without `pmac` the older rule still applies: among devices
+sharing an encryption key, keep the MAC ending in `00`.
 
 ### Cipher Versions
 
