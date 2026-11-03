@@ -218,6 +218,10 @@ reply = await device.send_command(["HeWatOutTemSet"], [45], strict_ack=True)
 data = await device.request_status(["Pow", "Mod", "HeWatOutTemSet"])
 ```
 
+Set `device.beeper = False` to have every `cmd` pack carry `Buzzer_ON_OFF=1`,
+which keeps the indoor unit from beeping on commands (2.6.0). The unit does not
+report this flag, so the caller owns the setting.
+
 `send_command(..., strict_ack=False)` (the default, used by
 `push_state_update()`) tolerates a missing acknowledgement and returns `None`;
 with `strict_ack=True` a missing reply raises `asyncio.TimeoutError`. Both work

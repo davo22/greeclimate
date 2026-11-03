@@ -277,3 +277,43 @@ async def test_filter_single_head_module_keeps_unit_drops_module():
     await api.close()
 
     assert [d.mac for d in kept] == ["c03937a426d8", "c03937a616ab00"]
+
+
+# ------------------------------------------------------------------ beeper ---
+
+@pytest.mark.asyncio
+async def test_beeper_off_appends_buzzer_flag_to_every_command():
+    """davo22/homeassistant-gree-cloud#50: Buzzer_ON_OFF=1 on each cmd pack keeps the unit silent."""
+    mqtt, module, head_a, _ = make_system()
+    head_a.beeper = False
+
+    head_a.mode = 1
+    head_a.power = True
+    await head_a.push_state_update()
+
+    cmds = [p["pack"] for p in module.published if p["pack"]["t"] == "cmd"]
+    assert len(cmds) == 2
+    for cmd in cmds:
+        assert cmd["opt"][-1] == "Buzzer_ON_OFF" and cmd["p"][-1] == 1
+    assert cmds[0]["opt"][0] == "Mod" and cmds[-1]["opt"][0] == "Pow"
+
+
+@pytest.mark.asyncio
+async def test_beeper_on_sends_plain_commands_and_status_never_carries_flag():
+    mqtt, module, head_a, _ = make_system()
+    head_a.beeper = False
+    await head_a.request_status(["Pow"])
+    head_a.beeper = True
+    await head_a.send_command(["Pow"], [1])
+
+    assert all("Buzzer_ON_OFF" not in p["pack"].get("opt", []) for p in module.published)
+    assert "Buzzer_ON_OFF" not in module.published[0]["pack"]
+
+
+@pytest.mark.asyncio
+async def test_beeper_flag_not_duplicated_when_caller_sets_it():
+    mqtt, module, head_a, _ = make_system()
+    head_a.beeper = False
+    await head_a.send_command(["Pow", "Buzzer_ON_OFF"], [1, 0])
+    cmd = module.published[-1]["pack"]
+    assert cmd["opt"].count("Buzzer_ON_OFF") == 1 and cmd["p"] == [1, 0]
