@@ -26,6 +26,18 @@ TRANSPORT_AUTO = "auto"
 TRANSPORT_MQTT = "mqtt"
 TRANSPORT_GATEWAY = "gateway"
 
+# How a sub-device (indoor unit behind a commercial module) is addressed.
+# "tcid": publish to the module topic with the unit id as ``tcid`` and a plain
+#         pack. Works on single-head commercial modules (verified).
+# "pack": publish to the module topic with the module as ``tcid`` and the unit
+#         named inside the encrypted pack (``"mac"``). This is how the Gree+ app
+#         drives multi-head/VRF systems (#33); used when "tcid" gets no answer.
+ADDRESSING_TCID = "tcid"
+ADDRESSING_PACK = "pack"
+
+# Keys that identify the indoor unit a reply belongs to on a shared module topic.
+_REPLY_UNIT_KEYS = ("sub", "mac")
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -39,7 +51,9 @@ class CloudDevice(Device):
     - Uses MQTT (protocol >= 3.2) or the cloud TLS gateway (older) instead of UDP
     - Temperature values are NOT offset (no +40 adjustment)
     - Commands must be sent sequentially with response wait
-    - Supports parent/child device hierarchy
+    - Indoor units behind a commercial module are addressed through the
+      module (``parent_mac`` from the cloud record's ``pmac``), replies are
+      routed per unit, and the addressing mode falls back automatically
     
     Example:
         ```python
@@ -80,6 +94,7 @@ class CloudDevice(Device):
         loop: asyncio.AbstractEventLoop = None,
         gateway: Optional[GreeCloudGateway] = None,
         transport: str = TRANSPORT_AUTO,
+        parent_mac: Optional[str] = None,
     ):
         """Initialize cloud device
         
@@ -96,6 +111,10 @@ class CloudDevice(Device):
             gateway: Shared GreeCloudGateway for pre-3.2 modules. Without it
                 every device uses MQTT, as before.
             transport: "auto" (from ``device_info.version``), "mqtt" or "gateway"
+            parent_mac: MAC of the module this unit sits behind, as reported by
+                the cloud record (``pmac``). Without it the module is guessed
+                by stripping a trailing ``00`` from the unit id, which is only
+                right for single-head modules.
         """
         super().__init__(device_info, timeout=timeout, loop=loop)
         
@@ -111,9 +130,12 @@ class CloudDevice(Device):
         else:
             self.device_cipher = CipherV1(device_key.encode())
         
-        # Detect parent/child MAC addresses
+        # Parent (module) / child (unit) addressing. The cloud record's pmac
+        # is authoritative; the "strip 00" guess is wrong for multi-head
+        # systems, whose unit ids do not derive from the module MAC (#6).
         self._child_mac = device_info.mac
-        self._parent_mac = self._detect_parent_mac(device_info.mac)
+        self._parent_mac = (parent_mac or "").strip() or self._detect_parent_mac(device_info.mac)
+        self._addressing = ADDRESSING_TCID
         
         # Response handling
         self._response_event: Optional[asyncio.Event] = None
@@ -131,6 +153,16 @@ class CloudDevice(Device):
             f"CloudDevice initialized: {device_info.name} (parent: {self._parent_mac}, "
             f"child: {self._child_mac}, ver: {device_info.version}, transport: {self.transport})"
         )
+
+    @property
+    def is_sub_device(self) -> bool:
+        """True when this unit is addressed through a separate module (parent) MAC."""
+        return self._parent_mac != self._child_mac
+
+    @property
+    def addressing(self) -> str:
+        """Current sub-device addressing mode: ADDRESSING_TCID or ADDRESSING_PACK."""
+        return self._addressing
 
     def _resolve_transport(self, requested: str) -> str:
         """Pick the transport: explicit request, else from the protocol version."""
@@ -201,17 +233,9 @@ class CloudDevice(Device):
         props = list(self._status_columns())
         if not self.hid:
             props.append('hid')
-        
-        command = {
-            't': 'status',
-            'cols': props
-        }
 
         try:
-            if self.uses_mqtt:
-                data = await self._mqtt_request(command, self._command_timeout)
-            else:
-                data = await self._gateway_status(command)
+            data = await self.request_status(props)
         except asyncio.TimeoutError:
             _LOGGER.warning(f"Timeout waiting for state update from {self.device_info.name}")
             raise
@@ -219,21 +243,118 @@ class CloudDevice(Device):
         if data:
             self.handle_state_update(**data)
 
-    async def _mqtt_request(self, command: Dict[str, Any], timeout: float) -> Optional[Dict[str, Any]]:
+    async def request_status(self, cols: List[str], timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Ask the device for the given property columns and return them as a dict.
+
+        Public request/response primitive. Does not touch the device state;
+        use :meth:`update_state` for that. Raises ``asyncio.TimeoutError`` (or
+        ``DeviceOfflineError``) when the device does not answer. A reply that
+        carries no ``dat`` pack yields an empty dict.
+
+        For a sub-device that never answers under the current addressing, the
+        other addressing mode is tried once and kept if it works.
+        """
+        command = {'t': 'status', 'cols': list(cols)}
+        timeout = self._command_timeout if timeout is None else timeout
+
+        if not self.uses_mqtt:
+            return self._decode_dat(await self._gateway_request(command)) or {}
+
+        try:
+            reply = await self._mqtt_request(command, timeout)
+        except asyncio.TimeoutError:
+            if not self.is_sub_device:
+                raise
+            other = ADDRESSING_PACK if self._addressing == ADDRESSING_TCID else ADDRESSING_TCID
+            _LOGGER.debug(
+                f"{self.device_info.name}: no answer with '{self._addressing}' addressing, "
+                f"trying '{other}'"
+            )
+            reply = await self._mqtt_request(command, timeout, addressing=other)
+            _LOGGER.info(
+                f"{self.device_info.name}: unit answers with '{other}' addressing "
+                f"(module {self._parent_mac}, unit {self._child_mac}); keeping it"
+            )
+            self._addressing = other
+        return self._decode_dat(reply) or {}
+
+    async def send_command(
+        self,
+        opt: List[str],
+        p: List[Any],
+        *,
+        strict_ack: bool = False,
+        timeout: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Send one ``cmd`` pack (``opt``/``p`` lists) and return the decrypted reply.
+
+        Public command primitive for callers that need the acknowledgement
+        itself (e.g. ``{"t": "res", "r": 200, "opt": [...], "p": [...]}``)
+        rather than the property staging of :meth:`push_state_update`.
+
+        Args:
+            opt: property names
+            p: values, same order as ``opt``
+            strict_ack: when True a missing reply raises ``asyncio.TimeoutError``;
+                when False (default) it is logged and None is returned, since
+                some modules execute commands without acknowledging them.
+            timeout: seconds to wait for the reply; defaults to the device's
+                command timeout when strict, 2 s otherwise. The gateway
+                transport answers in-band and ignores this.
+
+        Returns:
+            The decrypted reply pack, or None when nothing came back and
+            ``strict_ack`` is False.
+        """
+        command = {'t': 'cmd', 'opt': list(opt), 'p': list(p)}
+        _LOGGER.debug(f"Sending command to {self.device_info.name}: {opt} = {p}")
+
+        if not self.uses_mqtt:
+            # The gateway answers in-band; a missing reply is a real failure.
+            reply = await self._gateway_request(command)
+            _LOGGER.debug(f"Command reply from {self.device_info.name}: {reply}")
+            return reply
+
+        if timeout is None:
+            timeout = self._command_timeout if strict_ack else 2.0
+        try:
+            return await self._mqtt_request(command, timeout)
+        except asyncio.TimeoutError:
+            if strict_ack:
+                raise
+            _LOGGER.debug(f"No ack from {self.device_info.name} (command may still have been executed)")
+            return None
+
+    async def _mqtt_request(
+        self, command: Dict[str, Any], timeout: float, addressing: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """Publish *command* over MQTT and wait for the matching response.
 
-        Returns the decoded ``cols``/``dat`` mapping when the reply carried
-        one, None for a bare acknowledgement. Raises asyncio.TimeoutError
-        when nothing comes back within *timeout*.
+        Returns the decrypted reply pack (``{"t": "dat", ...}`` for status,
+        ``{"t": "res", ...}`` for an acknowledgement), or None when the reply
+        could not be decrypted. Raises asyncio.TimeoutError when nothing comes
+        back within *timeout*.
+
+        Sub-devices are addressed per *addressing* (default: the device's
+        current mode): ``tcid`` puts the unit id in the envelope, ``pack``
+        puts the module in the envelope and the unit inside the pack.
         """
+        addressing = addressing or self._addressing
+        if self.is_sub_device and addressing == ADDRESSING_PACK:
+            payload = {**command, 'mac': self._child_mac}
+            tcid = None  # envelope addressed to the module
+        else:
+            payload = command
+            tcid = self._child_mac
+
         self._response_event = asyncio.Event()
         self._response_data = None
         try:
             await self._mqtt_client.publish_command(
                 self._parent_mac,
-                command,
+                payload,
                 self.device_cipher,
-                self._child_mac
+                tcid
             )
             await asyncio.wait_for(self._response_event.wait(), timeout=timeout)
             return self._response_data
@@ -380,82 +501,92 @@ class CloudDevice(Device):
         return commands
     
     async def _send_command(self, opt: List[str], p: List[Any]) -> None:
-        """Send command and wait for response"""
-        _LOGGER.debug(f"Sending command to {self.device_info.name}: {opt} = {p}")
-        
-        command = {
-            't': 'cmd',
-            'opt': opt,
-            'p': p
-        }
-
-        if not self.uses_mqtt:
-            # The gateway answers in-band; a missing reply is a real failure.
-            reply = await self._gateway_request(command)
-            _LOGGER.debug(f"Command reply from {self.device_info.name}: {reply}")
-            return
-        
-        # Wait for response (short timeout - some devices don't ack)
-        try:
-            await self._mqtt_request(command, 2.0)
-        except asyncio.TimeoutError:
-            _LOGGER.debug(f"No ack from {self.device_info.name} (command may still have been executed)")
+        """Send one command from push_state_update(); a missing ack is tolerated."""
+        await self.send_command(opt, p)
     
+    def _reply_is_for_other_unit(self, pack: Dict[str, Any]) -> bool:
+        """True when a decrypted pack names a different indoor unit.
+
+        Several units behind one module share the module's topics, so every
+        head receives every reply. A pack that carries ``sub``/``mac`` for
+        another unit must be ignored, or one head's state overwrites the
+        others (#6, #33). Packs without a unit id are accepted as before.
+        """
+        for key in _REPLY_UNIT_KEYS:
+            unit = pack.get(key)
+            if isinstance(unit, str) and unit:
+                return unit not in (self._child_mac, self._parent_mac)
+        return False
+
     def _handle_mqtt_message(self, topic: str, message: MqttDeviceMessage) -> None:
         """Handle incoming MQTT messages"""
         # Check if message is for this device
         if self._parent_mac not in topic and self._child_mac not in topic:
             return
-        
-        # Handle response messages (command acknowledgments / state responses)
-        if 'response/' in topic:
-            if message.pack:
-                try:
-                    decrypted = self.device_cipher.decrypt(message.pack)
-                    _LOGGER.debug(f"Response decrypted: {decrypted}")
-                    if decrypted.get('t') == 'dat':
-                        cols = decrypted.get('cols', [])
-                        dat = decrypted.get('dat', [])
-                        if cols and dat and len(cols) == len(dat):
-                            data = dict(zip(cols, dat))
-                            if self._response_event:
-                                self._response_data = data
-                            else:
-                                self.handle_state_update(**data)
-                except Exception as e:
-                    _LOGGER.debug(f"Could not decrypt response: {e}")
-            if self._response_event:
-                self._response_event.set()
+
+        is_response = 'response/' in topic
+        is_status = 'status/' in topic
+        if not (is_response or is_status):
+            if 'connect/' in topic:
+                _LOGGER.info(f"Device {self.device_info.name} connected to cloud")
             return
-        
-        # Handle status messages
-        if 'status/' in topic and message.pack:
+
+        decrypted: Optional[Dict[str, Any]] = None
+        if message.pack:
             try:
                 decrypted = self.device_cipher.decrypt(message.pack)
-                
-                # Process status data
-                if decrypted.get('t') == 'dat':
-                    cols = decrypted.get('cols', [])
-                    dat = decrypted.get('dat', [])
-                    
-                    if cols and dat and len(cols) == len(dat):
-                        data = dict(zip(cols, dat))
-                        
-                        # Store for state update
-                        if self._response_event:
-                            self._response_data = data
-                            self._response_event.set()
-                        else:
-                            # Unsolicited status update
-                            self.handle_state_update(**data)
-            
+                _LOGGER.debug(f"{'Response' if is_response else 'Status'} decrypted: {decrypted}")
             except Exception as e:
-                _LOGGER.debug(f"Failed to decrypt status message: {e}")
-        
-        # Handle connect messages
-        if 'connect/' in topic:
-            _LOGGER.info(f"Device {self.device_info.name} connected to cloud")
+                _LOGGER.debug(f"Could not decrypt {'response' if is_response else 'status'}: {e}")
+            if isinstance(decrypted, dict) and self._reply_is_for_other_unit(decrypted):
+                return
+
+        if self._response_event:
+            # Somebody is waiting: a response always completes the wait (a bare
+            # ack carries no pack); a status push only when it decoded.
+            if is_response or decrypted is not None:
+                self._response_data = decrypted
+                self._response_event.set()
+            return
+
+        # Unsolicited data (status push, or a late response)
+        data = self._decode_dat(decrypted) if decrypted else None
+        if data:
+            self.handle_state_update(**data)
     
+    def handle_state_update(self, **kwargs) -> None:
+        """Normalise what commercial/VRF units report before applying it.
+
+        Indoor units behind a module (#6, #33) differ from split units:
+        unsupported numeric fields come back as ``""`` (applying those would
+        clobber good values), numbers may arrive as strings, and the room
+        temperature is reported as ``InTem`` rather than ``TemSen`` (same +40
+        offset). Everything else passes through unchanged.
+        """
+        cleaned: Dict[str, Any] = {}
+        for key, value in kwargs.items():
+            if isinstance(value, str):
+                text = value.strip()
+                if text == "":
+                    continue
+                if key != 'hid':
+                    try:
+                        value = int(text)
+                    except ValueError:
+                        try:
+                            value = float(text)
+                        except ValueError:
+                            pass
+            cleaned[key] = value
+
+        in_temp = cleaned.get('InTem')
+        if isinstance(in_temp, (int, float)) and not isinstance(in_temp, bool):
+            tem_sen = cleaned.get(Props.TEMP_SENSOR.value)
+            if not isinstance(tem_sen, (int, float)) or tem_sen == 0:
+                cleaned[Props.TEMP_SENSOR.value] = in_temp
+
+        super().handle_state_update(**cleaned)
+
     async def close(self):
         """Close device and cleanup resources"""
         try:
@@ -479,4 +610,5 @@ class CloudDevice(Device):
                 f"mac={self.device_info.mac}, "
                 f"parent_mac={self._parent_mac}, "
                 f"child_mac={self._child_mac}, "
+                f"addressing={self._addressing}, "
                 f"transport={self.transport})")

@@ -447,21 +447,32 @@ class GreeCloudApi:
         return filtered_devices
 
     def _filter_duplicate_devices(self, devices: List[CloudDeviceInfo]) -> List[CloudDeviceInfo]:
-        """Filter out duplicate devices with same key
+        """Drop module records and legacy duplicates, keep the controllable units.
 
-        When devices share the same encryption key but have different MACs
-        (one normal, one ending with '00'), keep only the one with '00'.
-        The device without '00' suffix doesn't respond to commands.
+        A commercial module shows up in the cloud list twice: once as itself
+        (``pmac`` empty, ``mid`` 60) and once per indoor unit behind it, each
+        unit carrying the module's MAC in ``pmac``. The module record is the
+        gateway, not something that can be controlled, so it is dropped
+        whenever another record names it as parent. Multi-head systems (#6)
+        list one record per head, all with the same ``pmac``; every head is
+        kept.
 
-        Args:
-            devices: List of devices to filter
-
-        Returns:
-            Filtered list without duplicates
+        Older heuristic, kept for records without ``pmac``: devices sharing an
+        encryption key where one MAC is the other plus ``00`` -- keep the
+        ``00`` one, the bare module MAC does not respond to commands.
         """
+        parent_macs = {d.parent_mac for d in devices if d.parent_mac}
+        modules = [d for d in devices if d.mac in parent_macs]
+        if modules:
+            _LOGGER.debug(
+                "Dropping module record(s) that other units name as parent: %s",
+                [d.mac for d in modules],
+            )
+        candidates = [d for d in devices if d.mac not in parent_macs]
+
         # Group devices by encryption key
         key_groups: Dict[str, List[CloudDeviceInfo]] = {}
-        for device in devices:
+        for device in candidates:
             if device.key not in key_groups:
                 key_groups[device.key] = []
             key_groups[device.key].append(device)
