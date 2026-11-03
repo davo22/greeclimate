@@ -38,6 +38,9 @@ ADDRESSING_PACK = "pack"
 # Keys that identify the indoor unit a reply belongs to on a shared module topic.
 _REPLY_UNIT_KEYS = ("sub", "mac")
 
+# Per-command flag: 1 = do not beep for this command. Not a reported property.
+BUZZER_FLAG = "Buzzer_ON_OFF"
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -136,6 +139,12 @@ class CloudDevice(Device):
         self._child_mac = device_info.mac
         self._parent_mac = (parent_mac or "").strip() or self._detect_parent_mac(device_info.mac)
         self._addressing = ADDRESSING_TCID
+
+        # Confirmation beep on commands. When False, every "cmd" pack carries
+        # Buzzer_ON_OFF=1 so the indoor unit stays silent (the unit does not
+        # report this flag; the Gree+ app and the local LAN protocol send it
+        # per command). davo22/homeassistant-gree-cloud#50
+        self.beeper: bool = True
         
         # Response handling
         self._response_event: Optional[asyncio.Event] = None
@@ -306,7 +315,11 @@ class CloudDevice(Device):
             The decrypted reply pack, or None when nothing came back and
             ``strict_ack`` is False.
         """
-        command = {'t': 'cmd', 'opt': list(opt), 'p': list(p)}
+        opt, p = list(opt), list(p)
+        if not self.beeper and BUZZER_FLAG not in opt:
+            opt.append(BUZZER_FLAG)
+            p.append(1)
+        command = {'t': 'cmd', 'opt': opt, 'p': p}
         _LOGGER.debug(f"Sending command to {self.device_info.name}: {opt} = {p}")
 
         if not self.uses_mqtt:
