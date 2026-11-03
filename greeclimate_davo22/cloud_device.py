@@ -18,6 +18,7 @@ from greeclimate_davo22.cipher import CipherV1, CipherV2
 from greeclimate_davo22.cloud_gateway import GreeCloudGateway, uses_mqtt
 from greeclimate_davo22.device import Device, Props
 from greeclimate_davo22.deviceinfo import DeviceInfo
+from greeclimate_davo22.exceptions import DeviceOfflineError
 from greeclimate_davo22.mqtt_client import GreeMqttClient, MqttDeviceMessage
 from greeclimate_davo22.taskable import Taskable
 
@@ -240,9 +241,42 @@ class CloudDevice(Device):
             self._response_event = None
             self._response_data = None
 
+    async def _gateway_request(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        """Send *command* through the legacy gateway.
+
+        Sub-devices of a commercial module carry the module MAC plus ``00`` as
+        their id. ``QueryOnline`` may list only the module as online; in that
+        case the request is addressed to the module (``tcid``) with the
+        sub-device named inside the encrypted pack (``mac``), the same way the
+        commercial MQTT path addresses indoor units (#33, #44). Whichever
+        target answered is remembered for the following requests.
+        """
+        target = getattr(self, "_gateway_target", None)
+        if target != self._parent_mac:
+            try:
+                reply = await self._gateway.request(self._child_mac, self._gateway_cipher(), command)
+                self._gateway_target = self._child_mac
+                return reply
+            except DeviceOfflineError:
+                if self._parent_mac == self._child_mac:
+                    raise
+                _LOGGER.debug(
+                    f"{self.device_info.name}: {self._child_mac} is offline for QueryOnline, "
+                    f"retrying through module {self._parent_mac}"
+                )
+        try:
+            reply = await self._gateway.request(
+                self._parent_mac, self._gateway_cipher(), {**command, "mac": self._child_mac}
+            )
+        except DeviceOfflineError:
+            self._gateway_target = None
+            raise
+        self._gateway_target = self._parent_mac
+        return reply
+
     async def _gateway_status(self, command: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Fetch a status pack through the legacy gateway and decode it."""
-        reply = await self._gateway.request(self._child_mac, self._gateway_cipher(), command)
+        reply = await self._gateway_request(command)
         return self._decode_dat(reply)
 
     @staticmethod
@@ -357,7 +391,7 @@ class CloudDevice(Device):
 
         if not self.uses_mqtt:
             # The gateway answers in-band; a missing reply is a real failure.
-            reply = await self._gateway.request(self._child_mac, self._gateway_cipher(), command)
+            reply = await self._gateway_request(command)
             _LOGGER.debug(f"Command reply from {self.device_info.name}: {reply}")
             return
         
