@@ -416,3 +416,64 @@ async def test_query_online_signs_mac_list_and_parses_servers():
         "aabbccddeeff": CloudDeviceServer("eu09.as.gree.com", 16387, True),
         "112233445566": CloudDeviceServer("eu01.as.gree.com", 16380, False),
     }
+
+
+CHILD_MAC = "9424b87b954300"
+PARENT_MAC = "9424b87b9543"
+
+
+def make_sub_device(gateway):
+    info = DeviceInfo("0.0.0.0", 0, CHILD_MAC, "indoor-unit", version="V1.1.0.0")
+    return CloudDevice(None, info, device_key=KEY, gateway=gateway)
+
+
+@pytest.mark.asyncio
+async def test_gateway_sub_device_falls_back_to_module_when_child_offline():
+    """A `...00` indoor unit that QueryOnline reports offline is reached through
+    its module: tcid = module MAC, sub-device named inside the pack (#44)."""
+    cipher = CipherV1(KEY.encode())
+    async with FakeGatewayServer(cipher, reply={"t": "dat", "cols": ["Pow", "SetTem"], "dat": [1, 22]}) as srv:
+        api = make_api()
+        server = CloudDeviceServer("127.0.0.1", srv.port, ssl=False)
+        api.query_online.side_effect = lambda macs: {PARENT_MAC: server} if macs == [PARENT_MAC] else {}
+        gw = GreeCloudGateway(api, timeout=2)
+        device = make_sub_device(gw)
+
+        await device.update_state()
+        device.power = False
+        await device.push_state_update()
+
+        assert device.raw_properties["SetTem"] == 22
+        assert [c.args[0] for c in api.query_online.await_args_list] == [[CHILD_MAC], [PARENT_MAC]]
+        assert [r["tcid"] for r in srv.received] == [PARENT_MAC, PARENT_MAC]
+        status = cipher.decrypt(srv.received[0]["pack"])
+        assert status["t"] == "status" and status["mac"] == CHILD_MAC
+        cmd = cipher.decrypt(srv.received[1]["pack"])
+        assert cmd == {"t": "cmd", "opt": ["Pow"], "p": [0], "mac": CHILD_MAC}
+
+
+@pytest.mark.asyncio
+async def test_gateway_sub_device_online_itself_is_addressed_directly():
+    cipher = CipherV1(KEY.encode())
+    async with FakeGatewayServer(cipher) as srv:
+        api = make_api()
+        api.query_online.return_value = {CHILD_MAC: CloudDeviceServer("127.0.0.1", srv.port, ssl=False)}
+        gw = GreeCloudGateway(api, timeout=2)
+        device = make_sub_device(gw)
+
+        await device.update_state()
+
+        api.query_online.assert_awaited_once_with([CHILD_MAC])
+        assert srv.received[0]["tcid"] == CHILD_MAC
+        assert "mac" not in cipher.decrypt(srv.received[0]["pack"])
+
+
+@pytest.mark.asyncio
+async def test_gateway_sub_device_offline_everywhere_raises():
+    api = make_api()
+    api.query_online.return_value = {}
+    device = make_sub_device(GreeCloudGateway(api, timeout=1))
+
+    with pytest.raises(DeviceOfflineError):
+        await device.update_state()
+    assert [c.args[0] for c in api.query_online.await_args_list] == [[CHILD_MAC], [PARENT_MAC]]

@@ -461,6 +461,13 @@ class Device(DeviceProtocol2, Taskable):
                 self.set_property(Props.TEMP_BIT, half)
                 self.set_property(Props.TEMP_HALF_DEGREE, half)
                 self.set_property(Props.TEMP_DECI, round(value * 10))
+            elif self.get_property(Props.TEMP_DECI) is not None:
+                # Some units (e.g. ducted systems behind an XE7C-24/HC wired
+                # controller) report SetDeciTem with HalfTemEn=0 and still take
+                # their setpoint from it. The temperature group is sent as one
+                # command, so a new SetTem next to a stale SetDeciTem is
+                # acknowledged and then ignored. Keep the two in step (#49).
+                self.set_property(Props.TEMP_DECI, int(value) * 10)
 
     @property
     def temperature_units(self) -> Optional[int]:

@@ -832,3 +832,37 @@ async def request_version_timeout_error(cipher, send):
 
     with pytest.raises(DeviceTimeoutError):
         await device.request_version() 
+
+
+@pytest.mark.asyncio
+async def test_send_temperature_celsius_keeps_setdecitem_in_step_without_halftemen(cipher, send):
+    """Units that report SetDeciTem with HalfTemEn=0 take the setpoint from
+    SetDeciTem (davo22/homeassistant-gree-cloud#49): a new SetTem sent next to
+    the old SetDeciTem is acked and ignored, so SetDeciTem must follow SetTem."""
+    device = await generate_device_mock_async()
+    device.temperature_units = TemperatureUnits.C
+    device.handle_state_update(**{"HalfTemEn": 0, "SetDeciTem": 190, "SetTem": 19})
+
+    device.target_temperature = 21
+    await device.push_state_update()
+
+    sent_pack = send.call_args[0][0]["pack"]
+    sent = dict(zip(sent_pack["opt"], sent_pack["p"]))
+    assert sent["SetTem"] == 21
+    assert sent["SetDeciTem"] == 210
+    assert "Add0.5" not in sent
+
+
+@pytest.mark.asyncio
+async def test_send_temperature_celsius_does_not_invent_setdecitem(cipher, send):
+    """A unit that never reported SetDeciTem must not start receiving it."""
+    device = await generate_device_mock_async()
+    device.temperature_units = TemperatureUnits.C
+    device.handle_state_update(**{"HalfTemEn": 0})
+    device._properties.pop("SetDeciTem", None)
+
+    device.target_temperature = 21
+    await device.push_state_update()
+
+    sent_pack = send.call_args[0][0]["pack"]
+    assert "SetDeciTem" not in sent_pack["opt"]
