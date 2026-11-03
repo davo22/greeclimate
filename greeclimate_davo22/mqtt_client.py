@@ -60,18 +60,27 @@ class GreeMqttClient:
     """
 
     # MQTT broker settings per region
+    # One broker per region; each resolves to the same address as the
+    # region's "<xx>.dis.gree.com" dispatcher. East South Asia is mqtt-hk
+    # (mqtt-as never existed); there is no Latin American broker, that
+    # region is served by South America (see cloud_api.REGION_ALIASES).
     MQTT_SERVERS = {
         'Australia': 'mqtt-au.gree.com',
         'China Mainland': 'mqtt.gree.com',
-        'East South Asia': 'mqtt-as.gree.com',
+        'East South Asia': 'mqtt-hk.gree.com',
         'Europe': 'mqtt-eu.gree.com',
         'India': 'mqtt-in.gree.com',
-        'Latin American': 'mqtt-la.gree.com',
         'Middle East': 'mqtt-me.gree.com',
         'North American': 'mqtt-na.gree.com',
         'Russia': 'mqtt-ru.gree.com',
         'South American': 'mqtt-sa.gree.com',
     }
+
+    @classmethod
+    def server_for_region(cls, region: str, default: str = 'mqtt-eu.gree.com') -> str:
+        """Return the broker for *region*, resolving aliases such as 'Latin American'."""
+        from greeclimate_davo22.cloud_api import resolve_region
+        return cls.MQTT_SERVERS.get(resolve_region(region), default)
 
     def __init__(
         self,

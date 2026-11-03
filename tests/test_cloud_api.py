@@ -265,3 +265,50 @@ class TestCloudDataClasses:
         creds = CloudCredentials(user_id=12345, token='test_token')
         assert creds.user_id == 12345
         assert creds.token == 'test_token'
+
+
+class TestRegions:
+    """Region tables and aliases (davo22/homeassistant-gree-cloud#34)."""
+
+    def test_no_latin_american_region_but_alias_to_south_america(self):
+        from greeclimate_davo22.cloud_api import REGION_ALIASES, resolve_region
+        from greeclimate_davo22.mqtt_client import GreeMqttClient
+        assert 'Latin American' not in GREE_CLOUD_SERVERS
+        assert 'Latin American' not in GreeMqttClient.MQTT_SERVERS
+        assert REGION_ALIASES['Latin American'] == 'South American'
+        assert resolve_region('Latin American') == 'South American'
+        assert resolve_region('Europe') == 'Europe'
+        assert GreeMqttClient.server_for_region('Latin American') == 'mqtt-sa.gree.com'
+        assert GreeMqttClient.server_for_region('East South Asia') == 'mqtt-hk.gree.com'
+        assert GreeMqttClient.server_for_region('Nowhere') == 'mqtt-eu.gree.com'
+
+    @pytest.mark.asyncio
+    async def test_for_server_accepts_alias(self):
+        async with GreeCloudApi.for_server('Latin American', 'u@example.com', 'pw') as api:
+            assert api.base_url == GREE_CLOUD_SERVERS['South American']
+
+    def test_rest_and_mqtt_tables_cover_the_same_regions(self):
+        from greeclimate_davo22.mqtt_client import GreeMqttClient
+        assert set(GREE_CLOUD_SERVERS) == set(GreeMqttClient.MQTT_SERVERS)
+
+    @pytest.mark.asyncio
+    async def test_fetch_regions_parses_directory(self):
+        payload = [{"id": 4, "name": "South American", "enName": "South American",
+                    "disHost": "sa.dis.gree.com", "apiHost": "eutmpgrih.gree.com", "region": "South American/bz"}]
+
+        class FakeResponse:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            def raise_for_status(self): pass
+            async def text(self): return json.dumps(payload)
+
+        class FakeSession:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            def get(self, url, timeout=None):
+                assert url.startswith("https://globalgrih.gree.com/")
+                return FakeResponse()
+
+        with patch("greeclimate_davo22.cloud_api.aiohttp.ClientSession", return_value=FakeSession()):
+            regions = await GreeCloudApi.fetch_regions()
+        assert regions[0]["disHost"] == "sa.dis.gree.com"

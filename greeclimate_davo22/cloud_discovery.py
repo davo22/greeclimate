@@ -103,7 +103,7 @@ class CloudDiscovery(Taskable):
         
         _LOGGER.info(f"Successfully authenticated as user {credentials.user_id}")
         
-        mqtt_server = GreeMqttClient.MQTT_SERVERS.get(self.server, 'mqtt-eu.gree.com')
+        mqtt_server = GreeMqttClient.server_for_region(self.server)
         
         # Create MQTT client with correct server and port
         self._mqtt_client = GreeMqttClient(

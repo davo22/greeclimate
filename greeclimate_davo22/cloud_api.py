@@ -8,9 +8,11 @@ including encryption keys required for MQTT communication.
 
 import hashlib
 import json
+
+import aiohttp
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 
 from Crypto.Cipher import AES
@@ -58,18 +60,37 @@ class CloudCredentials:
 
 
 # Gree Cloud API Servers by region
+# REST hosts per region. Every entry resolves and answers on 443 (checked
+# 2026-11-03). Gree's own region directory (see fetch_regions()) lists
+# Europe, East South Asia, North American, South American ("/bz"), China
+# Mainland, India and Middle East; Australia and Russia are not in it but
+# their hosts are live and in use. There is no Latin American region --
+# "lagrih" / "mqtt-la" never existed; Latin America is served by the South
+# American hosts (davo22/homeassistant-gree-cloud#34).
 GREE_CLOUD_SERVERS = {
     'Australia': 'https://augrih.gree.com',
     'China Mainland': 'https://grih.gree.com',
     'East South Asia': 'https://hkgrih.gree.com',
     'Europe': 'https://eugrih.gree.com',
     'India': 'https://ingrih.gree.com',
-    'Latin American': 'https://lagrih.gree.com',
     'Middle East': 'https://megrih.gree.com',
     'North American': 'https://nagrih.gree.com',
     'Russia': 'https://rugrih.gree.com',
     'South American': 'https://sagrih.gree.com',
 }
+
+# Region names accepted for compatibility, mapped to the real region.
+REGION_ALIASES = {
+    'Latin American': 'South American',
+}
+
+# Gree's region directory: any path on this host returns the list.
+GREE_REGION_DIRECTORY_URL = 'https://globalgrih.gree.com/App/GetRegion'
+
+
+def resolve_region(server: str) -> str:
+    """Return the canonical region name for *server* (aliases resolved)."""
+    return REGION_ALIASES.get(server, server)
 
 
 class GreeCloudApi:
@@ -114,9 +135,30 @@ class GreeCloudApi:
         Returns:
             GreeCloudApi instance configured for the specified region
         """
+        server = resolve_region(server)
         if server not in GREE_CLOUD_SERVERS:
             raise ValueError(f"Unknown server: {server}. Must be one of: {list(GREE_CLOUD_SERVERS.keys())}")
         return cls(GREE_CLOUD_SERVERS[server], username, password)
+
+    @staticmethod
+    async def fetch_regions(timeout: float = 10.0) -> List[Dict[str, Any]]:
+        """Fetch Gree's region directory.
+
+        Returns the list served by ``globalgrih.gree.com``: one dict per
+        region with ``id``, ``name``, ``enName``, ``disHost`` (the
+        region's dispatcher, which is also where its MQTT broker lives),
+        ``apiHost`` and ``region``. Diagnostic helper; the static tables
+        above are what the client uses.
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                GREE_REGION_DIRECTORY_URL, timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as response:
+                response.raise_for_status()
+                data = json.loads(await response.text())
+        if not isinstance(data, list):
+            raise ValueError("Unexpected region directory format")
+        return data
 
     def _md5(self, input_str: str) -> str:
         """Calculate MD5 hash"""
