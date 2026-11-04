@@ -307,7 +307,8 @@ class CloudDevice(Device):
         timeout = self._command_timeout if timeout is None else timeout
 
         if not self.uses_mqtt:
-            return self._decode_dat(await self._gateway_request(command)) or {}
+            reply = await self._gateway_request(command)
+            return self._status_data(reply)
 
         try:
             reply = await self._mqtt_request(command, timeout)
@@ -325,7 +326,26 @@ class CloudDevice(Device):
                 f"(module {self._parent_mac}, unit {self._child_mac}); keeping it"
             )
             self._addressing = other
-        return self._decode_dat(reply) or {}
+        return self._status_data(reply)
+
+    def _status_data(self, reply: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Decode a status reply; say so when the device answered with something else.
+
+        A reply that is not a ``dat`` pack (an error pack, a bare
+        acknowledgement, a pack for another unit without a unit id) used to
+        be swallowed as "no data", leaving the device bound with empty state
+        and the user with an *unknown* entity and no clue (#6).
+        """
+        data = self._decode_dat(reply)
+        if data:
+            return data
+        if reply:
+            _LOGGER.warning(
+                f"{self.device_info.name}: status request answered with a "
+                f"{reply.get('t', '?')!r} pack instead of data: "
+                f"{ {k: v for k, v in reply.items() if k != 'pack'} }"
+            )
+        return {}
 
     async def send_command(
         self,
