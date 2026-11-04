@@ -384,3 +384,25 @@ async def test_bind_keeps_mqtt_after_gateway_answers():
     assert device.transport == "mqtt"
     assert device.raw_properties["Pow"] == 1
     mqtt.subscribe_to_device.assert_awaited_once_with("c03937a426d8")
+
+
+@pytest.mark.asyncio
+async def test_non_dat_status_reply_is_logged_not_swallowed(caplog):
+    """#6: 'Study' bound with an empty state because the module answered a
+    status request with something that was not a dat pack."""
+    import logging
+    mqtt = MagicMock()
+    head = make_head(HEAD_A, mqtt)
+    cipher = CipherV1(KEY.encode())
+
+    async def publish(parent_mac, command, dev_cipher, tcid=None):
+        pack, _ = cipher.encrypt({"t": "res", "r": 404, "msg": "no such unit"})
+        msg = MagicMock(); msg.pack = pack
+        head._handle_mqtt_message(f"response/{parent_mac}/app", msg)
+    mqtt.publish_command = AsyncMock(side_effect=publish)
+
+    with caplog.at_level(logging.WARNING, logger="greeclimate_davo22.cloud_device"):
+        data = await head.request_status(["Pow"])
+    assert data == {}
+    assert "answered with a 'res' pack instead of data" in caplog.text
+    assert "404" in caplog.text
