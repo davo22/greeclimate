@@ -317,3 +317,70 @@ async def test_beeper_flag_not_duplicated_when_caller_sets_it():
     await head_a.send_command(["Pow", "Buzzer_ON_OFF"], [1, 0])
     cmd = module.published[-1]["pack"]
     assert cmd["opt"].count("Buzzer_ON_OFF") == 1 and cmd["p"] == [1, 0]
+
+
+# ------------------------------------------------------- transport fallback ---
+
+from greeclimate_davo22.cloud_gateway import GreeCloudGateway  # noqa: E402
+from greeclimate_davo22.exceptions import DeviceOfflineError  # noqa: E402
+
+
+def make_gateway(offline=True):
+    api = MagicMock()
+    api.user_id = 1
+    api.query_online = AsyncMock(return_value={})  # everything offline -> DeviceOfflineError
+    gw = GreeCloudGateway(api, timeout=0.1)
+    return gw
+
+
+def test_sub_device_with_old_version_string_starts_on_mqtt():
+    """#6: heads report the module's 'V1.1.0.0'; that must not force the gateway."""
+    mqtt = MagicMock()
+    head = make_head(HEAD_A, mqtt, gateway=make_gateway())
+    assert head.transport == "mqtt"
+
+
+def test_standalone_old_module_still_starts_on_gateway():
+    info = DeviceInfo("0.0.0.0", 0, "c03937a426d8", "split", version="V2.0.0")
+    device = CloudDevice(MagicMock(), info, device_key=KEY, gateway=make_gateway(), command_timeout=0.05)
+    assert device.transport == "gateway"
+
+
+@pytest.mark.asyncio
+async def test_bind_falls_back_to_gateway_when_mqtt_is_silent_and_back_when_both_are():
+    mqtt = MagicMock()
+    mqtt.publish_command = AsyncMock()
+    mqtt.subscribe_to_device = AsyncMock()
+    mqtt.unsubscribe_from_device = AsyncMock()
+    head = make_head(HEAD_A, mqtt, gateway=make_gateway())  # gateway: offline -> TimeoutError subclass
+
+    with pytest.raises(asyncio.TimeoutError):
+        await head.bind()
+
+    # tried MQTT (both addressings), then the gateway, then restored MQTT
+    assert mqtt.publish_command.await_count == 2
+    assert head.transport == "mqtt"
+    mqtt.unsubscribe_from_device.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bind_keeps_mqtt_after_gateway_answers():
+    """Standalone V2.0.0 module silent on the gateway but alive on MQTT."""
+    mqtt = MagicMock()
+    mqtt.subscribe_to_device = AsyncMock()
+    cipher = CipherV1(KEY.encode())
+    info = DeviceInfo("0.0.0.0", 0, "c03937a426d8", "split", version="V2.0.0")
+    device = CloudDevice(mqtt, info, device_key=KEY, gateway=make_gateway(), command_timeout=0.2)
+    assert device.transport == "gateway"
+
+    async def publish(parent_mac, command, dev_cipher, tcid=None):
+        pack, _ = cipher.encrypt({"t": "dat", "cols": ["Pow"], "dat": [1]})
+        msg = MagicMock(); msg.pack = pack
+        device._handle_mqtt_message(f"response/{parent_mac}/app", msg)
+    mqtt.publish_command = AsyncMock(side_effect=publish)
+
+    await device.bind()
+
+    assert device.transport == "mqtt"
+    assert device.raw_properties["Pow"] == 1
+    mqtt.subscribe_to_device.assert_awaited_once_with("c03937a426d8")

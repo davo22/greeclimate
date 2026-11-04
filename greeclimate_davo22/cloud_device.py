@@ -182,8 +182,21 @@ class CloudDevice(Device):
         if requested != TRANSPORT_AUTO:
             raise ValueError(f"Unknown transport: {requested!r}")
         if self._gateway is not None and not uses_mqtt(self.device_info.version):
+            # Indoor units behind a commercial module report the module's own
+            # version string (e.g. "V1.1.0.0"), which says nothing about how
+            # the module is reached; the only multi-head systems known to
+            # work were driven over MQTT (#33). Start there and let bind()
+            # fall back to the gateway if the module stays silent (#6).
+            if self.is_sub_device and self._mqtt_client is not None:
+                return TRANSPORT_MQTT
             return TRANSPORT_GATEWAY
         return TRANSPORT_MQTT
+
+    def _other_transport(self) -> Optional[str]:
+        """The transport to try when the chosen one gets no answer, if available."""
+        if self.transport == TRANSPORT_MQTT:
+            return TRANSPORT_GATEWAY if self._gateway is not None else None
+        return TRANSPORT_MQTT if self._mqtt_client is not None else None
 
     @property
     def uses_mqtt(self) -> bool:
@@ -219,11 +232,38 @@ class CloudDevice(Device):
         # Subscribe to device topics (gateway devices have nothing to subscribe to)
         if self.uses_mqtt:
             await self._mqtt_client.subscribe_to_device(self._parent_mac)
-        
+
         _LOGGER.info(f"Cloud device bound: {self.device_info.name} ({self.transport})")
-        
-        # Trigger initial state update
-        await self.update_state()
+
+        # Trigger initial state update. A device that stays silent on the
+        # transport picked from its version string gets one try on the other
+        # transport (when the caller provided both); whichever answers is
+        # kept. Only at bind time, so a dead device costs two timeouts once,
+        # not on every poll.
+        try:
+            await self.update_state()
+        except asyncio.TimeoutError:
+            other = self._other_transport()
+            if other is None:
+                raise
+            first = self.transport
+            _LOGGER.info(
+                f"{self.device_info.name}: no answer over {first}, trying {other}"
+            )
+            self.transport = other
+            if self.uses_mqtt:
+                await self._mqtt_client.subscribe_to_device(self._parent_mac)
+            try:
+                await self.update_state()
+            except asyncio.TimeoutError:
+                self.transport = first
+                if other == TRANSPORT_MQTT:
+                    try:
+                        await self._mqtt_client.unsubscribe_from_device(self._parent_mac)
+                    except Exception:  # pragma: no cover - best effort
+                        pass
+                raise
+            _LOGGER.info(f"{self.device_info.name}: answers over {other}; keeping it")
 
     def _status_columns(self) -> List[str]:
         """Property keys requested by update_state(); subclasses may extend."""
