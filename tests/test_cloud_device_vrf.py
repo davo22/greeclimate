@@ -486,7 +486,7 @@ async def test_sub_device_finds_the_variant_and_chunks_columns_then_siblings_ski
         data_b = await head_b.request_status(cols)
         assert set(cols) <= set(data_b)  # plus the probe columns
         assert all(t == HEAD_B and len(inner["cols"]) <= 16 for t, inner in srv.received)
-        assert len(srv.received) == 1 + 7  # first-contact probe, then 35 columns in chunks of 5
+        assert len(srv.received) == 1 + 8  # first-contact probe, then the 40 columns in chunks of 5
 
         # Commands follow the learned variant.
         srv.received.clear()
