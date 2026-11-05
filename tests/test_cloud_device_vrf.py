@@ -322,7 +322,6 @@ async def test_beeper_flag_not_duplicated_when_caller_sets_it():
 # ------------------------------------------------------- transport fallback ---
 
 from greeclimate_davo22.cloud_gateway import GreeCloudGateway  # noqa: E402
-from greeclimate_davo22.exceptions import DeviceOfflineError  # noqa: E402
 
 
 def make_gateway(offline=True):
