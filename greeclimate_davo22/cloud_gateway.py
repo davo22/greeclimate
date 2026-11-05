@@ -158,15 +158,23 @@ class GreeCloudGateway:
             return outer
         return cipher.decrypt(outer["pack"])
 
-    async def request(self, mac: str, cipher: CipherV1, command: Dict[str, Any]) -> Dict[str, Any]:
+    async def request(
+        self, mac: str, cipher: CipherV1, command: Dict[str, Any], tcid: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Send one command to the device and return the decrypted reply.
 
+        *mac* selects the gateway (QueryOnline); the envelope's ``tcid`` is
+        *mac* unless *tcid* names another unit reached through that gateway.
         Raises asyncio.TimeoutError (or DeviceOfflineError) when the device
         cannot be reached or does not answer within the timeout.
         """
         server = await self.server_for(mac)
-        payload = self.build_envelope(mac, cipher, command)
-        _LOGGER.debug("Gateway request to %s via %s:%s: %s", mac, server.host, server.port, command.get("t"))
+        payload = self.build_envelope(tcid or mac, cipher, command)
+        _LOGGER.debug(
+            "Gateway request to %s via %s:%s: %s (tcid %s, %s)",
+            mac, server.host, server.port, command.get("t"), tcid or mac,
+            ",".join(k for k in command if k != "cols") + (f", {len(command['cols'])} cols" if "cols" in command else ""),
+        )
 
         try:
             reader, writer = await asyncio.wait_for(
