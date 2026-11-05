@@ -45,8 +45,11 @@ def _clear_module_hints():
     cloud_device._UNITS_BY_MODULE.clear()
     cloud_device._MODULE_GATEWAY_LOCKS.clear()
     cloud_device._MODULE_GATEWAY_LAST.clear()
+    cloud_device._MODULE_GATEWAY_OFFLINE_UNTIL.clear()
     spacing = cloud_device.GATEWAY_REQUEST_SPACING
+    chunk = cloud_device.GATEWAY_COLS_CHUNK
     yield
+    cloud_device.GATEWAY_COLS_CHUNK = chunk
     cloud_device.GATEWAY_REQUEST_SPACING = spacing
     cloud_device._MODULE_HINTS.clear()
     cloud_device._UNITS_BY_MODULE.clear()

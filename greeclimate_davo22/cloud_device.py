@@ -65,7 +65,9 @@ _GATEWAY_SUB_DEVICE_VARIANTS = (
 # controllers on the line protocol may drop the ~80-column request (#6).
 GATEWAY_PROBE_COLS = ["Pow", "Mod", "SetTem", "TemSen", "WdSpd"]
 # Chunk size for modules that answer the short request but not the full one.
-GATEWAY_COLS_CHUNK = 16
+# The #6 controller dropped its gateway session right after a 16-column
+# request and answered 5-column ones reliably, so stay at probe size.
+GATEWAY_COLS_CHUNK = 5
 
 # What the first unit behind a module learned, shared with its siblings so
 # they skip the search: {module_mac: {"transport": ..., "gateway_variant": ...,
@@ -79,6 +81,10 @@ _MODULE_GATEWAY_LOCKS: Dict[str, asyncio.Lock] = {}
 _MODULE_GATEWAY_LAST: Dict[str, float] = {}
 GATEWAY_REQUEST_SPACING = 0.5  # seconds between requests to one module
 GATEWAY_MIN_CHUNK = 5
+# After the gateway says "device is not online" the module needs a while to
+# come back; requests in that window fail fast instead of piling up.
+GATEWAY_OFFLINE_BACKOFF = 60.0
+_MODULE_GATEWAY_OFFLINE_UNTIL: Dict[str, float] = {}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -237,13 +243,11 @@ class CloudDevice(Device):
         if learned == TRANSPORT_MQTT and self._mqtt_client is not None:
             return TRANSPORT_MQTT
         if self._gateway is not None and not uses_mqtt(self.device_info.version):
-            # Indoor units behind a commercial module report the module's own
-            # version string (e.g. "V1.1.0.0"), which says nothing about how
-            # the module is reached; the only multi-head systems known to
-            # work were driven over MQTT (#33). Start there and let bind()
-            # fall back to the gateway if the module stays silent (#6).
-            if self.is_sub_device and self._mqtt_client is not None:
-                return TRANSPORT_MQTT
+            # The #6 controller (units reporting the module's "V1.1.0.0")
+            # lives on the legacy gateway; QueryOnline settles that in well
+            # under a second, while an MQTT attempt costs 20 s per unit and
+            # pushed Home Assistant's setup over its limit. Start on the
+            # gateway; bind() still falls back to MQTT if it stays silent.
             return TRANSPORT_GATEWAY
         return TRANSPORT_MQTT
 
@@ -602,6 +606,12 @@ class CloudDevice(Device):
 
     async def _gateway_send(self, variant: str, command: Dict[str, Any]) -> Dict[str, Any]:
         """Send *command* with one addressing variant, one at a time per module."""
+        until = _MODULE_GATEWAY_OFFLINE_UNTIL.get(self._parent_mac)
+        if until is not None and asyncio.get_running_loop().time() < until:
+            raise DeviceOfflineError(
+                f"{self.device_info.name}: module {self._parent_mac} reported offline by the "
+                f"gateway, waiting before retrying"
+            )
         lock = _MODULE_GATEWAY_LOCKS.setdefault(self._parent_mac, asyncio.Lock())
         async with lock:
             last = _MODULE_GATEWAY_LAST.get(self._parent_mac)
@@ -615,6 +625,21 @@ class CloudDevice(Device):
                 _MODULE_GATEWAY_LAST[self._parent_mac] = asyncio.get_running_loop().time()
 
     async def _gateway_send_now(self, variant: str, command: Dict[str, Any]) -> Dict[str, Any]:
+        """Send *command* with one addressing variant; back off when the gateway
+        reports the module offline (``{"t": "res", "r": 404, "msg": "device is not online"}``)."""
+        reply = await self._gateway_send_variant(variant, command)
+        if isinstance(reply, dict) and reply.get('r') == 404 and 'not online' in str(reply.get('msg', '')):
+            _MODULE_GATEWAY_OFFLINE_UNTIL[self._parent_mac] = (
+                asyncio.get_running_loop().time() + GATEWAY_OFFLINE_BACKOFF
+            )
+            _LOGGER.warning(
+                f"{self.device_info.name}: gateway reports module {self._parent_mac} offline; "
+                f"pausing requests to it for {GATEWAY_OFFLINE_BACKOFF:.0f} s"
+            )
+            raise DeviceOfflineError(f"{self.device_info.name}: {reply.get('msg')}")
+        return reply
+
+    async def _gateway_send_variant(self, variant: str, command: Dict[str, Any]) -> Dict[str, Any]:
         """Send *command* with one addressing variant."""
         cipher = self._gateway_cipher()
         if variant == GATEWAY_VIA_UNIT:
