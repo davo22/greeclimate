@@ -43,6 +43,12 @@ def _clear_module_hints():
     from greeclimate_davo22 import cloud_device
     cloud_device._MODULE_HINTS.clear()
     cloud_device._UNITS_BY_MODULE.clear()
+    cloud_device._MODULE_GATEWAY_LOCKS.clear()
+    cloud_device._MODULE_GATEWAY_LAST.clear()
+    spacing = cloud_device.GATEWAY_REQUEST_SPACING
     yield
+    cloud_device.GATEWAY_REQUEST_SPACING = spacing
     cloud_device._MODULE_HINTS.clear()
     cloud_device._UNITS_BY_MODULE.clear()
+    cloud_device._MODULE_GATEWAY_LOCKS.clear()
+    cloud_device._MODULE_GATEWAY_LAST.clear()

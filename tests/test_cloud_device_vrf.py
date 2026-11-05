@@ -575,3 +575,78 @@ async def test_closed_unit_is_no_longer_a_sibling():
     head_a._handle_mqtt_message(f"response/{MODULE}/app", _pack_msg(cipher, {
         "t": "dat", "sub": HEAD_B, "cols": ["SetTem"], "dat": [18]}))
     assert head_a.raw_properties["SetTem"] == 18
+
+
+# ---------------------------------------------- gateway serialisation / chunks ---
+
+class FlakyModuleGateway(PickyModuleGateway):
+    """Answers plain module requests (tcid module, no mac) of <= max_cols columns,
+    refuses to answer while another connection is open, and can fail a given
+    chunk size once."""
+
+    def __init__(self, cipher, max_cols=16, fail_sizes_once=()):
+        super().__init__(cipher, max_cols=max_cols, want_tcid="module")
+        self.open = 0
+        self.max_open = 0
+        self.fail_once = set(fail_sizes_once)
+
+    async def handle(self, reader, writer):
+        self.open += 1
+        self.max_open = max(self.max_open, self.open)
+        try:
+            line = await reader.readline()
+            outer = _json.loads(line)
+            inner = self.cipher.decrypt(outer["pack"])
+            self.received.append((outer["tcid"], inner))
+            n = len(inner.get("cols", []))
+            if self.open > 1 or inner.get("t") != "status" or "mac" in inner or n > self.max_cols:
+                return
+            if n in self.fail_once:
+                self.fail_once.discard(n)
+                return
+            reply = {"t": "dat", "cols": inner["cols"], "dat": [("" if c == "hid" else 7) for c in inner["cols"]]}
+            pack, _ = self.cipher.encrypt(reply)
+            writer.write(_json.dumps({"t": "pack", "pack": pack, "tcid": "app"}).encode() + b"\n")
+            await writer.drain()
+        finally:
+            self.open -= 1
+            writer.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_heads_are_serialised_per_module_and_chunks_shrink_on_failure():
+    cipher = CipherV1(KEY.encode())
+    async with FlakyModuleGateway(cipher, max_cols=16, fail_sizes_once={16}) as srv:
+        gw = GreeCloudGateway(_module_only_api(srv.port), timeout=0.3)
+        _cd.GATEWAY_REQUEST_SPACING = 0.01
+        heads = [CloudDevice(None, DeviceInfo("0.0.0.0", 0, m, m[:4], version="V1.1.0.0"),
+                             device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
+                 for m in (HEAD_A, HEAD_B, "c14d9403500000", "49ad0b24890000")]
+        cols = [f"C{i}" for i in range(40)]
+
+        results = await asyncio.gather(*(h.request_status(cols) for h in heads))
+
+        assert srv.max_open == 1  # never two connections to the module at once
+        for data in results:
+            assert set(cols) <= set(data)
+        # the 16-column chunk failed once -> halved to 8 and remembered
+        assert _cd._MODULE_HINTS[MODULE]["gateway_cols_limit"] == 8
+        assert _cd._MODULE_HINTS[MODULE]["gateway_variant"] == "module-plain"
+
+
+@pytest.mark.asyncio
+async def test_partial_answer_keeps_the_unit_alive(caplog):
+    """A chunk that stays silent even at the minimum size is skipped, not fatal."""
+    import logging
+    cipher = CipherV1(KEY.encode())
+    async with FlakyModuleGateway(cipher, max_cols=16, fail_sizes_once={5}) as srv:
+        gw = GreeCloudGateway(_module_only_api(srv.port), timeout=0.3)
+        _cd.GATEWAY_REQUEST_SPACING = 0.01
+        head = CloudDevice(None, DeviceInfo("0.0.0.0", 0, HEAD_A, "A", version="V1.1.0.0"),
+                           device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
+        head._gateway_cols_limit = 5
+        cols = [f"C{i}" for i in range(12)]
+        with caplog.at_level(logging.WARNING, logger="greeclimate_davo22.cloud_device"):
+            data = await head.request_status(cols)
+        assert 0 < len(data) < len(cols)
+        assert "went unanswered this poll" in caplog.text

@@ -20,7 +20,6 @@ from greeclimate_davo22.device import Device, Props
 from greeclimate_davo22.deviceinfo import DeviceInfo
 from greeclimate_davo22.exceptions import DeviceOfflineError
 from greeclimate_davo22.mqtt_client import GreeMqttClient, MqttDeviceMessage
-from greeclimate_davo22.taskable import Taskable
 
 TRANSPORT_AUTO = "auto"
 TRANSPORT_MQTT = "mqtt"
@@ -72,6 +71,14 @@ GATEWAY_COLS_CHUNK = 16
 # they skip the search: {module_mac: {"transport": ..., "gateway_variant": ...,
 # "gateway_cols_limit": ...}}.
 _MODULE_HINTS: Dict[str, Dict[str, Any]] = {}
+
+# One request at a time per module on the legacy gateway, with a pause
+# between them: four units polling an old controller at the same moment,
+# each opening its own connections, is what made it stop answering (#6).
+_MODULE_GATEWAY_LOCKS: Dict[str, asyncio.Lock] = {}
+_MODULE_GATEWAY_LAST: Dict[str, float] = {}
+GATEWAY_REQUEST_SPACING = 0.5  # seconds between requests to one module
+GATEWAY_MIN_CHUNK = 5
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -236,8 +243,15 @@ class CloudDevice(Device):
         return TRANSPORT_MQTT
 
     def _remember(self, **hints: Any) -> None:
-        """Record what worked for this module, for the siblings behind it."""
-        _MODULE_HINTS.setdefault(self._parent_mac, {}).update(hints)
+        """Record what worked for this module, for the siblings behind it.
+
+        A column limit only ever gets smaller: a sibling that is still probing
+        must not undo what another one learned the hard way.
+        """
+        current = _MODULE_HINTS.setdefault(self._parent_mac, {})
+        if "gateway_cols_limit" in hints and current.get("gateway_cols_limit") is not None:
+            hints["gateway_cols_limit"] = min(hints["gateway_cols_limit"], current["gateway_cols_limit"])
+        current.update(hints)
 
     def _other_transport(self) -> Optional[str]:
         """The transport to try when the chosen one gets no answer, if available."""
@@ -491,6 +505,10 @@ class CloudDevice(Device):
         marked as needing chunked requests and the rest is fetched in chunks
         of GATEWAY_COLS_CHUNK. The limit is shared with sibling units.
         """
+        # Siblings may have learned the limit while we were waiting.
+        hinted = _MODULE_HINTS.get(self._parent_mac, {}).get("gateway_cols_limit")
+        if hinted is not None and (self._gateway_cols_limit is None or hinted < self._gateway_cols_limit):
+            self._gateway_cols_limit = hinted
         limit = self._gateway_cols_limit
         if limit is None:
             try:
@@ -507,7 +525,8 @@ class CloudDevice(Device):
                 )
                 reply = await self._gateway_request({'t': 'status', 'cols': GATEWAY_PROBE_COLS})
                 data = self._status_data(reply)
-                limit = GATEWAY_COLS_CHUNK
+                hinted = _MODULE_HINTS.get(self._parent_mac, {}).get("gateway_cols_limit")
+                limit = min(GATEWAY_COLS_CHUNK, hinted) if hinted else GATEWAY_COLS_CHUNK
                 self._gateway_cols_limit = limit
                 self._remember(gateway_cols_limit=limit)
                 _LOGGER.info(
@@ -519,21 +538,64 @@ class CloudDevice(Device):
                 rest = cols
         else:
             data, rest = {}, cols
-        for i in range(0, len(rest), limit):
+        missing: List[str] = []
+        i = 0
+        while i < len(rest):
             chunk = rest[i:i + limit]
-            reply = await self._gateway_request({'t': 'status', 'cols': chunk})
+            try:
+                reply = await self._gateway_request({'t': 'status', 'cols': chunk})
+            except asyncio.TimeoutError:
+                if limit > GATEWAY_MIN_CHUNK:
+                    # Smaller pieces, same position; remember it for the siblings.
+                    limit = max(GATEWAY_MIN_CHUNK, limit // 2)
+                    self._gateway_cols_limit = limit
+                    self._remember(gateway_cols_limit=limit)
+                    _LOGGER.debug(
+                        f"{self.device_info.name}: no answer to a {len(chunk)}-column chunk, "
+                        f"continuing with chunks of {limit}"
+                    )
+                    continue
+                # Already at the minimum: keep what we have rather than lose the unit.
+                missing.extend(chunk)
+                i += len(chunk)
+                continue
             data.update(self._status_data(reply))
+            i += len(chunk)
+        if missing:
+            if data:
+                _LOGGER.warning(
+                    f"{self.device_info.name}: {len(missing)} of {len(cols)} properties went "
+                    f"unanswered this poll (e.g. {', '.join(missing[:5])}); keeping the rest"
+                )
+            else:
+                raise asyncio.TimeoutError(f"{self.device_info.name}: no status chunk answered")
         return data
 
     def _gateway_variants(self) -> List[str]:
         """Addressing variants to try, the learned one first."""
         if not self.is_sub_device:
             return [GATEWAY_VIA_UNIT]
+        if not self._gateway_variant:
+            self._gateway_variant = _MODULE_HINTS.get(self._parent_mac, {}).get("gateway_variant")
         if self._gateway_variant:
             return [self._gateway_variant]
         return list(_GATEWAY_SUB_DEVICE_VARIANTS)
 
     async def _gateway_send(self, variant: str, command: Dict[str, Any]) -> Dict[str, Any]:
+        """Send *command* with one addressing variant, one at a time per module."""
+        lock = _MODULE_GATEWAY_LOCKS.setdefault(self._parent_mac, asyncio.Lock())
+        async with lock:
+            last = _MODULE_GATEWAY_LAST.get(self._parent_mac)
+            if last is not None:
+                wait = GATEWAY_REQUEST_SPACING - (asyncio.get_running_loop().time() - last)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+            try:
+                return await self._gateway_send_now(variant, command)
+            finally:
+                _MODULE_GATEWAY_LAST[self._parent_mac] = asyncio.get_running_loop().time()
+
+    async def _gateway_send_now(self, variant: str, command: Dict[str, Any]) -> Dict[str, Any]:
         """Send *command* with one addressing variant."""
         cipher = self._gateway_cipher()
         if variant == GATEWAY_VIA_UNIT:
