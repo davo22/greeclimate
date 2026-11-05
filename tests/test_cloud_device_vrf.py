@@ -474,8 +474,9 @@ async def test_sub_device_finds_the_variant_and_chunks_columns_then_siblings_ski
         assert set(cols) <= set(data)  # plus the five probe columns
         assert head_a._gateway_variant == "module-as-unit"
         assert head_a._gateway_cols_limit == 16
-        # search: 40-col request via module (silent), via module-as-unit (silent: too long);
-        # probe: 5 cols via module-as-unit (answered); then 3 chunks of <=16 of the remaining 35
+        # first contact: 5-col probe through the variants (module silent, module-as-unit
+        # answers); then the 35 remaining columns in one go (silent: too long) and in
+        # 3 chunks of <=16
         tcids = [t for t, _ in srv.received]
         assert tcids[-3:] == [HEAD_A, HEAD_A, HEAD_A]
         answered = [inner for t, inner in srv.received if t == HEAD_A and len(inner["cols"]) <= 16]
@@ -487,9 +488,9 @@ async def test_sub_device_finds_the_variant_and_chunks_columns_then_siblings_ski
         head_b = CloudDevice(None, DeviceInfo("0.0.0.0", 0, HEAD_B, "B", version="V1.1.0.0"),
                              device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
         data_b = await head_b.request_status(cols)
-        assert set(data_b) == set(cols)
+        assert set(cols) <= set(data_b)  # plus the probe columns
         assert all(t == HEAD_B and len(inner["cols"]) <= 16 for t, inner in srv.received)
-        assert len(srv.received) == 3
+        assert len(srv.received) == 1 + 3  # first-contact probe, then 35 columns in chunks of 16
 
         # Commands follow the learned variant.
         srv.received.clear()
@@ -645,8 +646,78 @@ async def test_partial_answer_keeps_the_unit_alive(caplog):
         head = CloudDevice(None, DeviceInfo("0.0.0.0", 0, HEAD_A, "A", version="V1.1.0.0"),
                            device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
         head._gateway_cols_limit = 5
+        head._gateway_warm = True  # a unit that has answered before; one chunk now stays silent
         cols = [f"C{i}" for i in range(12)]
         with caplog.at_level(logging.WARNING, logger="greeclimate_davo22.cloud_device"):
             data = await head.request_status(cols)
         assert 0 < len(data) < len(cols)
         assert "went unanswered this poll" in caplog.text
+
+
+# ---------------------------------------------------- first contact probe ---
+
+class ColdStartModuleGateway(PickyModuleGateway):
+    """Answers a unit's requests of <= 16 columns only after that unit has
+    sent a <= 5-column request first (what #6's controller does)."""
+
+    def __init__(self, cipher):
+        super().__init__(cipher, max_cols=16, want_tcid="module")
+        self.warm = set()
+
+    async def handle(self, reader, writer):
+        line = await reader.readline()
+        outer = _json.loads(line)
+        inner = self.cipher.decrypt(outer["pack"])
+        self.received.append((outer["tcid"], inner))
+        unit = inner.get("mac")
+        n = len(inner.get("cols", []))
+        ok = inner.get("t") == "status" and unit and outer["tcid"] == MODULE and (
+            n <= 5 or (unit in self.warm and n <= 16))
+        if ok:
+            self.warm.add(unit)
+            reply = {"t": "dat", "r": 200, "mac": unit, "cols": inner["cols"],
+                     "dat": [("" if c == "hid" else 3) for c in inner["cols"]]}
+            pack, _ = self.cipher.encrypt(reply)
+            writer.write(_json.dumps({"t": "pack", "pack": pack, "tcid": "app"}).encode() + b"\n")
+            await writer.drain()
+        writer.close()
+
+
+@pytest.mark.asyncio
+async def test_first_head_probes_first_and_siblings_probe_before_chunks():
+    cipher = CipherV1(KEY.encode())
+    async with ColdStartModuleGateway(cipher) as srv:
+        gw = GreeCloudGateway(_module_only_api(srv.port), timeout=0.3)
+        _cd.GATEWAY_REQUEST_SPACING = 0.01
+        cols = [f"C{i}" for i in range(40)]
+        head_a = CloudDevice(None, DeviceInfo("0.0.0.0", 0, HEAD_A, "A", version="V1.1.0.0"),
+                             device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
+        data = await head_a.request_status(cols)
+        assert set(cols) <= set(data)
+        # the very first thing sent for the unit was the 5-column probe
+        first_for_a = next(inner for t, inner in srv.received if inner.get("mac") == HEAD_A)
+        assert len(first_for_a["cols"]) == 5
+
+        srv.received.clear()
+        head_b = CloudDevice(None, DeviceInfo("0.0.0.0", 0, HEAD_B, "B", version="V1.1.0.0"),
+                             device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
+        assert head_b._gateway_cols_limit == 16 and head_b._gateway_variant == "module"
+        data_b = await head_b.request_status(cols)
+        assert set(cols) <= set(data_b)
+        sizes = [len(inner["cols"]) for t, inner in srv.received]
+        assert sizes[0] == 5 and all(n <= 16 for n in sizes)
+        assert len(srv.received) == 1 + 3  # probe + 35 remaining in chunks of 16
+
+
+@pytest.mark.asyncio
+async def test_no_cross_transport_fallback_when_module_transport_is_known():
+    mqtt = MagicMock(); mqtt.publish_command = AsyncMock(); mqtt.subscribe_to_device = AsyncMock(); mqtt.unsubscribe_from_device = AsyncMock()
+    api = MagicMock(); api.user_id = 1; api.query_online = AsyncMock(return_value={})
+    gw = GreeCloudGateway(api, timeout=0.1)
+    _cd._MODULE_HINTS[MODULE] = {"transport": "gateway", "gateway_variant": "module", "gateway_cols_limit": 16}
+    head = CloudDevice(mqtt, DeviceInfo("0.0.0.0", 0, HEAD_B, "B", version="V1.1.0.0"),
+                       device_key=KEY, gateway=gw, parent_mac=MODULE, command_timeout=0.1)
+    assert head.transport == "gateway"
+    with pytest.raises(asyncio.TimeoutError):
+        await head.bind()
+    mqtt.publish_command.assert_not_awaited()
