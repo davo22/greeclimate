@@ -519,3 +519,59 @@ async def test_bind_remembers_transport_for_siblings():
         await head_b.bind()
         assert mqtt.publish_command.await_count == published  # no MQTT attempt at all
         assert head_b.raw_properties.get("Pow") == 1
+
+
+# --------------------------------------------------------- #66 regression ---
+
+def _pack_msg(cipher, payload):
+    pack, _ = cipher.encrypt(payload)
+    msg = MagicMock(); msg.pack = pack
+    return msg
+
+
+def test_internal_mac_with_own_cid_is_accepted_on_a_standalone_unit():
+    """#66: U-WB05WR11 replies carry mac=internal id and cid=cloud MAC; 2.5.0 dropped them."""
+    mqtt = MagicMock()
+    unit = CloudDevice(mqtt, DeviceInfo("0.0.0.0", 0, "7cb8e6441234", "Salon", version="V3.2.M"), device_key=KEY)
+    cipher = CipherV1(KEY.encode())
+    unit._handle_mqtt_message("response/7cb8e6441234/app", _pack_msg(cipher, {
+        "t": "dat", "uid": 1, "mac": "000000221859", "cid": "7cb8e6441234",
+        "cols": ["Pow", "Mod"], "dat": [1, 4], "r": 200}))
+    assert unit.raw_properties["Pow"] == 1
+
+
+def test_unknown_mac_without_cid_is_accepted_when_there_are_no_siblings():
+    mqtt = MagicMock()
+    unit = CloudDevice(mqtt, DeviceInfo("0.0.0.0", 0, "7cb8e6441234", "Salon"), device_key=KEY)
+    cipher = CipherV1(KEY.encode())
+    unit._handle_mqtt_message("response/7cb8e6441234/app", _pack_msg(cipher, {
+        "t": "dat", "mac": "deadbeef0000", "cols": ["Pow"], "dat": [1]}))
+    assert unit.raw_properties["Pow"] == 1
+
+
+def test_only_a_registered_sibling_id_is_treated_as_someone_else():
+    mqtt, module, head_a, head_b = make_system()
+    cipher = module.cipher
+    # internal id, unknown to anyone -> accepted
+    head_a._handle_mqtt_message(f"response/{MODULE}/app", _pack_msg(cipher, {
+        "t": "dat", "mac": "000000221859", "cols": ["SetTem"], "dat": [21]}))
+    assert head_a.raw_properties["SetTem"] == 21
+    # the sibling's id -> dropped
+    head_a._handle_mqtt_message(f"response/{MODULE}/app", _pack_msg(cipher, {
+        "t": "dat", "sub": HEAD_B, "cols": ["SetTem"], "dat": [18]}))
+    assert head_a.raw_properties["SetTem"] == 21
+    # own cid wins even if mac names the sibling (defensive)
+    head_a._handle_mqtt_message(f"response/{MODULE}/app", _pack_msg(cipher, {
+        "t": "dat", "mac": HEAD_B, "cid": HEAD_A, "cols": ["SetTem"], "dat": [19]}))
+    assert head_a.raw_properties["SetTem"] == 19
+
+
+@pytest.mark.asyncio
+async def test_closed_unit_is_no_longer_a_sibling():
+    mqtt, module, head_a, head_b = make_system()
+    mqtt.unsubscribe_from_device = AsyncMock(); mqtt.remove_message_handler = MagicMock()
+    await head_b.close()
+    cipher = module.cipher
+    head_a._handle_mqtt_message(f"response/{MODULE}/app", _pack_msg(cipher, {
+        "t": "dat", "sub": HEAD_B, "cols": ["SetTem"], "dat": [18]}))
+    assert head_a.raw_properties["SetTem"] == 18

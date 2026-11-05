@@ -38,6 +38,12 @@ ADDRESSING_PACK = "pack"
 # Keys that identify the indoor unit a reply belongs to on a shared module topic.
 _REPLY_UNIT_KEYS = ("sub", "mac")
 
+# Units currently instantiated behind each module: {module_mac: {unit_mac, ...}}.
+# A reply is only dropped when it names one of *these* other units; modules
+# that put an internal id in "mac" (U-WB05WR11: "000000221859" with the cloud
+# MAC in "cid") must not be mistaken for someone else's reply (#66).
+_UNITS_BY_MODULE: Dict[str, set] = {}
+
 # Per-command flag: 1 = do not beep for this command. Not a reported property.
 BUZZER_FLAG = "Buzzer_ON_OFF"
 
@@ -165,6 +171,7 @@ class CloudDevice(Device):
         self._child_mac = device_info.mac
         self._parent_mac = (parent_mac or "").strip() or self._detect_parent_mac(device_info.mac)
         self._addressing = ADDRESSING_TCID
+        _UNITS_BY_MODULE.setdefault(self._parent_mac, set()).add(self._child_mac)
         # Legacy gateway: addressing variant and column limit, learned on the
         # first exchange (or taken from a sibling behind the same module).
         hints = _MODULE_HINTS.get(self._parent_mac, {})
@@ -694,17 +701,25 @@ class CloudDevice(Device):
         await self.send_command(opt, p)
     
     def _reply_is_for_other_unit(self, pack: Dict[str, Any]) -> bool:
-        """True when a decrypted pack names a different indoor unit.
+        """True when a decrypted pack names a different unit behind this module.
 
         Several units behind one module share the module's topics, so every
-        head receives every reply. A pack that carries ``sub``/``mac`` for
-        another unit must be ignored, or one head's state overwrites the
-        others (#6, #33). Packs without a unit id are accepted as before.
+        head receives every reply, and a pack carrying ``sub``/``mac`` for a
+        sibling must be ignored or one head's state overwrites the others
+        (#6, #33). Only ids of units actually instantiated behind the same
+        module count as "someone else": some modules put an internal id in
+        ``mac`` and the cloud MAC in ``cid`` (#66), and such packs are ours.
+        A ``cid`` equal to our MAC settles it outright.
         """
+        if pack.get('cid') in (self._child_mac, self._parent_mac):
+            return False
+        siblings = _UNITS_BY_MODULE.get(self._parent_mac, set()) - {self._child_mac}
+        if not siblings:
+            return False
         for key in _REPLY_UNIT_KEYS:
             unit = pack.get(key)
-            if isinstance(unit, str) and unit:
-                return unit not in (self._child_mac, self._parent_mac)
+            if isinstance(unit, str) and unit in siblings:
+                return True
         return False
 
     def _handle_mqtt_message(self, topic: str, message: MqttDeviceMessage) -> None:
@@ -780,6 +795,7 @@ class CloudDevice(Device):
 
     async def close(self):
         """Close device and cleanup resources"""
+        _UNITS_BY_MODULE.get(self._parent_mac, set()).discard(self._child_mac)
         try:
             if self._mqtt_client is not None:
                 # Unsubscribe from MQTT topics
