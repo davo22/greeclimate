@@ -20,7 +20,6 @@ from greeclimate_davo22.device import Device, Props
 from greeclimate_davo22.deviceinfo import DeviceInfo
 from greeclimate_davo22.exceptions import DeviceOfflineError
 from greeclimate_davo22.mqtt_client import GreeMqttClient, MqttDeviceMessage
-from greeclimate_davo22.taskable import Taskable
 
 TRANSPORT_AUTO = "auto"
 TRANSPORT_MQTT = "mqtt"
