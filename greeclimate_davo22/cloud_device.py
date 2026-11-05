@@ -184,6 +184,11 @@ class CloudDevice(Device):
         hints = _MODULE_HINTS.get(self._parent_mac, {})
         self._gateway_variant: Optional[str] = hints.get("gateway_variant")
         self._gateway_cols_limit: Optional[int] = hints.get("gateway_cols_limit")
+        # True once this unit got any gateway reply. A unit's first contact
+        # is always the short probe: the controller in #6 answered 16-column
+        # chunks for the unit that had been probed and ignored them for the
+        # units that started cold.
+        self._gateway_warm = False
 
         # Confirmation beep on commands. When False, every "cmd" pack carries
         # Buzzer_ON_OFF=1 so the indoor unit stays silent (the unit does not
@@ -305,7 +310,10 @@ class CloudDevice(Device):
             await self.update_state()
         except asyncio.TimeoutError:
             other = self._other_transport()
-            if other is None:
+            known = _MODULE_HINTS.get(self._parent_mac, {}).get("transport")
+            if other is None or (known == self.transport and self.is_sub_device):
+                # A sibling already proved this module lives on this
+                # transport; trying the other one only costs time (#6).
                 raise
             first = self.transport
             _LOGGER.info(
@@ -510,21 +518,36 @@ class CloudDevice(Device):
         if hinted is not None and (self._gateway_cols_limit is None or hinted < self._gateway_cols_limit):
             self._gateway_cols_limit = hinted
         limit = self._gateway_cols_limit
+        data: Dict[str, Any] = {}
+        rest = list(cols)
+        if not self._gateway_warm and (self.is_sub_device or limit is not None) and len(cols) > len(GATEWAY_PROBE_COLS):
+            # First contact with this unit: the short probe. It finds the
+            # addressing variant cheaply and wakes the controller up for the
+            # unit before anything bigger is asked.
+            reply = await self._gateway_request({'t': 'status', 'cols': GATEWAY_PROBE_COLS})
+            data = self._status_data(reply)
+            self._gateway_warm = True
+            rest = [c for c in cols if c not in GATEWAY_PROBE_COLS]
         if limit is None:
             try:
-                reply = await self._gateway_request({'t': 'status', 'cols': cols})
-                return self._status_data(reply)
+                reply = await self._gateway_request({'t': 'status', 'cols': rest})
+                data.update(self._status_data(reply))
+                self._gateway_warm = True
+                return data
             except DeviceOfflineError:
                 raise  # nobody to probe
             except asyncio.TimeoutError:
-                if len(cols) <= len(GATEWAY_PROBE_COLS):
+                if len(rest) <= len(GATEWAY_PROBE_COLS):
                     raise
-                _LOGGER.debug(
-                    f"{self.device_info.name}: no answer to a {len(cols)}-column status, "
-                    f"trying {len(GATEWAY_PROBE_COLS)} columns"
-                )
-                reply = await self._gateway_request({'t': 'status', 'cols': GATEWAY_PROBE_COLS})
-                data = self._status_data(reply)
+                if not self._gateway_warm:
+                    _LOGGER.debug(
+                        f"{self.device_info.name}: no answer to a {len(rest)}-column status, "
+                        f"trying {len(GATEWAY_PROBE_COLS)} columns"
+                    )
+                    reply = await self._gateway_request({'t': 'status', 'cols': GATEWAY_PROBE_COLS})
+                    data.update(self._status_data(reply))
+                    self._gateway_warm = True
+                    rest = [c for c in rest if c not in GATEWAY_PROBE_COLS]
                 hinted = _MODULE_HINTS.get(self._parent_mac, {}).get("gateway_cols_limit")
                 limit = min(GATEWAY_COLS_CHUNK, hinted) if hinted else GATEWAY_COLS_CHUNK
                 self._gateway_cols_limit = limit
@@ -533,11 +556,6 @@ class CloudDevice(Device):
                     f"{self.device_info.name}: module answers short status requests only; "
                     f"splitting into chunks of {limit} columns"
                 )
-                rest = [c for c in cols if c not in GATEWAY_PROBE_COLS]
-            else:  # pragma: no cover - defensive
-                rest = cols
-        else:
-            data, rest = {}, cols
         missing: List[str] = []
         i = 0
         while i < len(rest):
@@ -560,6 +578,7 @@ class CloudDevice(Device):
                 i += len(chunk)
                 continue
             data.update(self._status_data(reply))
+            self._gateway_warm = True
             i += len(chunk)
         if missing:
             if data:
