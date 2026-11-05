@@ -35,3 +35,14 @@ def network_fixture():
     """Patch the device object."""
     with patch.object(Device, "send") as mock:
         yield mock
+
+
+@pytest.fixture(autouse=True)
+def _clear_module_hints():
+    """What one CloudDevice learned about its module must not leak into the next test."""
+    from greeclimate_davo22 import cloud_device
+    cloud_device._MODULE_HINTS.clear()
+    cloud_device._UNITS_BY_MODULE.clear()
+    yield
+    cloud_device._MODULE_HINTS.clear()
+    cloud_device._UNITS_BY_MODULE.clear()

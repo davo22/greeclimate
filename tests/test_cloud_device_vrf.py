@@ -322,7 +322,6 @@ async def test_beeper_flag_not_duplicated_when_caller_sets_it():
 # ------------------------------------------------------- transport fallback ---
 
 from greeclimate_davo22.cloud_gateway import GreeCloudGateway  # noqa: E402
-from greeclimate_davo22.exceptions import DeviceOfflineError  # noqa: E402
 
 
 def make_gateway(offline=True):
@@ -406,3 +405,173 @@ async def test_non_dat_status_reply_is_logged_not_swallowed(caplog):
     assert data == {}
     assert "answered with a 'res' pack instead of data" in caplog.text
     assert "404" in caplog.text
+
+
+# ---------------------------------------------- gateway variants / chunks ---
+
+import json as _json  # noqa: E402
+from greeclimate_davo22.cloud_api import CloudDeviceServer  # noqa: E402
+from greeclimate_davo22 import cloud_device as _cd  # noqa: E402
+
+
+class PickyModuleGateway:
+    """A commercial controller on the line protocol: answers only when the
+    envelope names the unit (tcid) and the pack has at most 16 columns."""
+
+    def __init__(self, cipher, max_cols=16, want_tcid="unit"):
+        self.cipher = cipher
+        self.max_cols = max_cols
+        self.want_tcid = want_tcid
+        self.received = []
+        self.server = None
+
+    async def handle(self, reader, writer):
+        line = await reader.readline()
+        outer = _json.loads(line)
+        inner = self.cipher.decrypt(outer["pack"])
+        self.received.append((outer["tcid"], inner))
+        unit = inner.get("mac")
+        ok_tcid = (outer["tcid"] == unit) if self.want_tcid == "unit" else (outer["tcid"] != unit)
+        if inner.get("t") == "status" and ok_tcid and unit and len(inner["cols"]) <= self.max_cols:
+            reply = {"t": "dat", "sub": unit, "cols": inner["cols"], "dat": [("" if c == "hid" else 1) for c in inner["cols"]]}
+            pack, _ = self.cipher.encrypt(reply)
+            writer.write(_json.dumps({"t": "pack", "pack": pack, "tcid": "app"}).encode() + b"\n")
+            await writer.drain()
+        elif inner.get("t") == "cmd" and ok_tcid and unit:
+            pack, _ = self.cipher.encrypt({"t": "res", "r": 200, "sub": unit, "opt": inner["opt"], "p": inner["p"]})
+            writer.write(_json.dumps({"t": "pack", "pack": pack, "tcid": "app"}).encode() + b"\n")
+            await writer.drain()
+        # otherwise: stay silent, like the real thing
+        writer.close()
+
+    async def __aenter__(self):
+        self.server = await asyncio.start_server(self.handle, "127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+        return self
+
+    async def __aexit__(self, *exc):
+        self.server.close()
+        await self.server.wait_closed()
+
+
+def _module_only_api(port):
+    api = MagicMock(); api.user_id = 1
+    api.query_online = AsyncMock(side_effect=lambda macs: {MODULE: CloudDeviceServer("127.0.0.1", port, ssl=False)} if macs == [MODULE] else {})
+    return api
+
+
+@pytest.mark.asyncio
+async def test_sub_device_finds_the_variant_and_chunks_columns_then_siblings_skip_the_search():
+    cipher = CipherV1(KEY.encode())
+    async with PickyModuleGateway(cipher) as srv:
+        gw = GreeCloudGateway(_module_only_api(srv.port), timeout=0.3)
+        head_a = CloudDevice(None, DeviceInfo("0.0.0.0", 0, HEAD_A, "A", version="V1.1.0.0"),
+                             device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
+        cols = [f"C{i}" for i in range(40)]
+
+        data = await head_a.request_status(cols)
+
+        assert set(cols) <= set(data)  # plus the five probe columns
+        assert head_a._gateway_variant == "module-as-unit"
+        assert head_a._gateway_cols_limit == 16
+        # search: 40-col request via module (silent), via module-as-unit (silent: too long);
+        # probe: 5 cols via module-as-unit (answered); then 3 chunks of <=16 of the remaining 35
+        tcids = [t for t, _ in srv.received]
+        assert tcids[-3:] == [HEAD_A, HEAD_A, HEAD_A]
+        answered = [inner for t, inner in srv.received if t == HEAD_A and len(inner["cols"]) <= 16]
+        assert len(answered) == 4  # probe + 3 chunks
+        assert _cd._MODULE_HINTS[MODULE] == {"gateway_variant": "module-as-unit", "gateway_cols_limit": 16}
+
+        # A sibling created afterwards uses the learned variant and limit straight away.
+        srv.received.clear()
+        head_b = CloudDevice(None, DeviceInfo("0.0.0.0", 0, HEAD_B, "B", version="V1.1.0.0"),
+                             device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
+        data_b = await head_b.request_status(cols)
+        assert set(data_b) == set(cols)
+        assert all(t == HEAD_B and len(inner["cols"]) <= 16 for t, inner in srv.received)
+        assert len(srv.received) == 3
+
+        # Commands follow the learned variant.
+        srv.received.clear()
+        head_b.power = True
+        await head_b.push_state_update()
+        assert srv.received[0][0] == HEAD_B and srv.received[0][1]["mac"] == HEAD_B
+
+
+@pytest.mark.asyncio
+async def test_bind_remembers_transport_for_siblings():
+    """Once head A ends up on the gateway, head B starts there instead of MQTT."""
+    cipher = CipherV1(KEY.encode())
+    async with PickyModuleGateway(cipher) as srv:
+        gw = GreeCloudGateway(_module_only_api(srv.port), timeout=0.3)
+        mqtt = MagicMock(); mqtt.publish_command = AsyncMock(); mqtt.subscribe_to_device = AsyncMock(); mqtt.unsubscribe_from_device = AsyncMock()
+        head_a = CloudDevice(mqtt, DeviceInfo("0.0.0.0", 0, HEAD_A, "A", version="V1.1.0.0"),
+                             device_key=KEY, gateway=gw, parent_mac=MODULE, command_timeout=0.1)
+        assert head_a.transport == "mqtt"
+        await head_a.bind()
+        assert head_a.transport == "gateway"
+        assert _cd._MODULE_HINTS[MODULE]["transport"] == "gateway"
+
+        head_b = CloudDevice(mqtt, DeviceInfo("0.0.0.0", 0, HEAD_B, "B", version="V1.1.0.0"),
+                             device_key=KEY, gateway=gw, parent_mac=MODULE, command_timeout=0.1)
+        assert head_b.transport == "gateway"
+        published = mqtt.publish_command.await_count
+        await head_b.bind()
+        assert mqtt.publish_command.await_count == published  # no MQTT attempt at all
+        assert head_b.raw_properties.get("Pow") == 1
+
+
+# --------------------------------------------------------- #66 regression ---
+
+def _pack_msg(cipher, payload):
+    pack, _ = cipher.encrypt(payload)
+    msg = MagicMock(); msg.pack = pack
+    return msg
+
+
+def test_internal_mac_with_own_cid_is_accepted_on_a_standalone_unit():
+    """#66: U-WB05WR11 replies carry mac=internal id and cid=cloud MAC; 2.5.0 dropped them."""
+    mqtt = MagicMock()
+    unit = CloudDevice(mqtt, DeviceInfo("0.0.0.0", 0, "7cb8e6441234", "Salon", version="V3.2.M"), device_key=KEY)
+    cipher = CipherV1(KEY.encode())
+    unit._handle_mqtt_message("response/7cb8e6441234/app", _pack_msg(cipher, {
+        "t": "dat", "uid": 1, "mac": "000000221859", "cid": "7cb8e6441234",
+        "cols": ["Pow", "Mod"], "dat": [1, 4], "r": 200}))
+    assert unit.raw_properties["Pow"] == 1
+
+
+def test_unknown_mac_without_cid_is_accepted_when_there_are_no_siblings():
+    mqtt = MagicMock()
+    unit = CloudDevice(mqtt, DeviceInfo("0.0.0.0", 0, "7cb8e6441234", "Salon"), device_key=KEY)
+    cipher = CipherV1(KEY.encode())
+    unit._handle_mqtt_message("response/7cb8e6441234/app", _pack_msg(cipher, {
+        "t": "dat", "mac": "deadbeef0000", "cols": ["Pow"], "dat": [1]}))
+    assert unit.raw_properties["Pow"] == 1
+
+
+def test_only_a_registered_sibling_id_is_treated_as_someone_else():
+    mqtt, module, head_a, head_b = make_system()
+    cipher = module.cipher
+    # internal id, unknown to anyone -> accepted
+    head_a._handle_mqtt_message(f"response/{MODULE}/app", _pack_msg(cipher, {
+        "t": "dat", "mac": "000000221859", "cols": ["SetTem"], "dat": [21]}))
+    assert head_a.raw_properties["SetTem"] == 21
+    # the sibling's id -> dropped
+    head_a._handle_mqtt_message(f"response/{MODULE}/app", _pack_msg(cipher, {
+        "t": "dat", "sub": HEAD_B, "cols": ["SetTem"], "dat": [18]}))
+    assert head_a.raw_properties["SetTem"] == 21
+    # own cid wins even if mac names the sibling (defensive)
+    head_a._handle_mqtt_message(f"response/{MODULE}/app", _pack_msg(cipher, {
+        "t": "dat", "mac": HEAD_B, "cid": HEAD_A, "cols": ["SetTem"], "dat": [19]}))
+    assert head_a.raw_properties["SetTem"] == 19
+
+
+@pytest.mark.asyncio
+async def test_closed_unit_is_no_longer_a_sibling():
+    mqtt, module, head_a, head_b = make_system()
+    mqtt.unsubscribe_from_device = AsyncMock(); mqtt.remove_message_handler = MagicMock()
+    await head_b.close()
+    cipher = module.cipher
+    head_a._handle_mqtt_message(f"response/{MODULE}/app", _pack_msg(cipher, {
+        "t": "dat", "sub": HEAD_B, "cols": ["SetTem"], "dat": [18]}))
+    assert head_a.raw_properties["SetTem"] == 18

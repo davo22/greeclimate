@@ -317,7 +317,9 @@ async def test_gateway_device_push_state_sends_cmd():
         await device.push_state_update()
 
         cmd = cipher.decrypt(srv.received[0]["pack"])
-        assert cmd == {"t": "cmd", "opt": ["Pow"], "p": [1]}
+        # The pack names the unit, as the Gree+ app does on this protocol.
+        assert cmd == {"t": "cmd", "opt": ["Pow"], "p": [1], "mac": MAC}
+        assert srv.received[0]["tcid"] == MAC
         assert device._dirty == []
 
 
@@ -465,7 +467,7 @@ async def test_gateway_sub_device_online_itself_is_addressed_directly():
 
         api.query_online.assert_awaited_once_with([CHILD_MAC])
         assert srv.received[0]["tcid"] == CHILD_MAC
-        assert "mac" not in cipher.decrypt(srv.received[0]["pack"])
+        assert cipher.decrypt(srv.received[0]["pack"])["mac"] == CHILD_MAC
 
 
 @pytest.mark.asyncio

@@ -38,8 +38,40 @@ ADDRESSING_PACK = "pack"
 # Keys that identify the indoor unit a reply belongs to on a shared module topic.
 _REPLY_UNIT_KEYS = ("sub", "mac")
 
+# Units currently instantiated behind each module: {module_mac: {unit_mac, ...}}.
+# A reply is only dropped when it names one of *these* other units; modules
+# that put an internal id in "mac" (U-WB05WR11: "000000221859" with the cloud
+# MAC in "cid") must not be mistaken for someone else's reply (#66).
+_UNITS_BY_MODULE: Dict[str, set] = {}
+
 # Per-command flag: 1 = do not beep for this command. Not a reported property.
 BUZZER_FLAG = "Buzzer_ON_OFF"
+
+# Legacy gateway: how a request for a unit behind a module is addressed.
+# ("route", "tcid", inner-mac): route = whose gateway QueryOnline resolves,
+# tcid = who the envelope names, inner-mac = whether the pack carries "mac".
+# Tried in this order the first time a unit is reached (#6, #44).
+GATEWAY_VIA_UNIT = "unit"           # QueryOnline(unit), tcid unit, mac in pack
+GATEWAY_VIA_MODULE = "module"       # QueryOnline(module), tcid module, mac in pack
+GATEWAY_VIA_MODULE_AS_UNIT = "module-as-unit"  # QueryOnline(module), tcid unit, mac in pack
+GATEWAY_MODULE_PLAIN = "module-plain"          # QueryOnline(module), tcid module, no mac
+_GATEWAY_SUB_DEVICE_VARIANTS = (
+    GATEWAY_VIA_UNIT,
+    GATEWAY_VIA_MODULE,
+    GATEWAY_VIA_MODULE_AS_UNIT,
+    GATEWAY_MODULE_PLAIN,
+)
+
+# Short status request used to find out whether a module answers at all; old
+# controllers on the line protocol may drop the ~80-column request (#6).
+GATEWAY_PROBE_COLS = ["Pow", "Mod", "SetTem", "TemSen", "WdSpd"]
+# Chunk size for modules that answer the short request but not the full one.
+GATEWAY_COLS_CHUNK = 16
+
+# What the first unit behind a module learned, shared with its siblings so
+# they skip the search: {module_mac: {"transport": ..., "gateway_variant": ...,
+# "gateway_cols_limit": ...}}.
+_MODULE_HINTS: Dict[str, Dict[str, Any]] = {}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -139,6 +171,12 @@ class CloudDevice(Device):
         self._child_mac = device_info.mac
         self._parent_mac = (parent_mac or "").strip() or self._detect_parent_mac(device_info.mac)
         self._addressing = ADDRESSING_TCID
+        _UNITS_BY_MODULE.setdefault(self._parent_mac, set()).add(self._child_mac)
+        # Legacy gateway: addressing variant and column limit, learned on the
+        # first exchange (or taken from a sibling behind the same module).
+        hints = _MODULE_HINTS.get(self._parent_mac, {})
+        self._gateway_variant: Optional[str] = hints.get("gateway_variant")
+        self._gateway_cols_limit: Optional[int] = hints.get("gateway_cols_limit")
 
         # Confirmation beep on commands. When False, every "cmd" pack carries
         # Buzzer_ON_OFF=1 so the indoor unit stays silent (the unit does not
@@ -181,6 +219,11 @@ class CloudDevice(Device):
             return requested
         if requested != TRANSPORT_AUTO:
             raise ValueError(f"Unknown transport: {requested!r}")
+        learned = _MODULE_HINTS.get(self._parent_mac, {}).get("transport")
+        if learned == TRANSPORT_GATEWAY and self._gateway is not None:
+            return TRANSPORT_GATEWAY
+        if learned == TRANSPORT_MQTT and self._mqtt_client is not None:
+            return TRANSPORT_MQTT
         if self._gateway is not None and not uses_mqtt(self.device_info.version):
             # Indoor units behind a commercial module report the module's own
             # version string (e.g. "V1.1.0.0"), which says nothing about how
@@ -191,6 +234,10 @@ class CloudDevice(Device):
                 return TRANSPORT_MQTT
             return TRANSPORT_GATEWAY
         return TRANSPORT_MQTT
+
+    def _remember(self, **hints: Any) -> None:
+        """Record what worked for this module, for the siblings behind it."""
+        _MODULE_HINTS.setdefault(self._parent_mac, {}).update(hints)
 
     def _other_transport(self) -> Optional[str]:
         """The transport to try when the chosen one gets no answer, if available."""
@@ -264,6 +311,7 @@ class CloudDevice(Device):
                         pass
                 raise
             _LOGGER.info(f"{self.device_info.name}: answers over {other}; keeping it")
+        self._remember(transport=self.transport)
 
     def _status_columns(self) -> List[str]:
         """Property keys requested by update_state(); subclasses may extend."""
@@ -307,8 +355,7 @@ class CloudDevice(Device):
         timeout = self._command_timeout if timeout is None else timeout
 
         if not self.uses_mqtt:
-            reply = await self._gateway_request(command)
-            return self._status_data(reply)
+            return await self._gateway_status_cols(list(cols))
 
         try:
             reply = await self._mqtt_request(command, timeout)
@@ -435,38 +482,114 @@ class CloudDevice(Device):
             self._response_event = None
             self._response_data = None
 
+    async def _gateway_status_cols(self, cols: List[str]) -> Dict[str, Any]:
+        """Status over the gateway, in chunks when the module wants it that way.
+
+        Old controllers on the line protocol accept a five-column request but
+        drop the ~80-column one (#6). The first request that goes unanswered
+        is retried with GATEWAY_PROBE_COLS; if that answers, the module is
+        marked as needing chunked requests and the rest is fetched in chunks
+        of GATEWAY_COLS_CHUNK. The limit is shared with sibling units.
+        """
+        limit = self._gateway_cols_limit
+        if limit is None:
+            try:
+                reply = await self._gateway_request({'t': 'status', 'cols': cols})
+                return self._status_data(reply)
+            except DeviceOfflineError:
+                raise  # nobody to probe
+            except asyncio.TimeoutError:
+                if len(cols) <= len(GATEWAY_PROBE_COLS):
+                    raise
+                _LOGGER.debug(
+                    f"{self.device_info.name}: no answer to a {len(cols)}-column status, "
+                    f"trying {len(GATEWAY_PROBE_COLS)} columns"
+                )
+                reply = await self._gateway_request({'t': 'status', 'cols': GATEWAY_PROBE_COLS})
+                data = self._status_data(reply)
+                limit = GATEWAY_COLS_CHUNK
+                self._gateway_cols_limit = limit
+                self._remember(gateway_cols_limit=limit)
+                _LOGGER.info(
+                    f"{self.device_info.name}: module answers short status requests only; "
+                    f"splitting into chunks of {limit} columns"
+                )
+                rest = [c for c in cols if c not in GATEWAY_PROBE_COLS]
+            else:  # pragma: no cover - defensive
+                rest = cols
+        else:
+            data, rest = {}, cols
+        for i in range(0, len(rest), limit):
+            chunk = rest[i:i + limit]
+            reply = await self._gateway_request({'t': 'status', 'cols': chunk})
+            data.update(self._status_data(reply))
+        return data
+
+    def _gateway_variants(self) -> List[str]:
+        """Addressing variants to try, the learned one first."""
+        if not self.is_sub_device:
+            return [GATEWAY_VIA_UNIT]
+        if self._gateway_variant:
+            return [self._gateway_variant]
+        return list(_GATEWAY_SUB_DEVICE_VARIANTS)
+
+    async def _gateway_send(self, variant: str, command: Dict[str, Any]) -> Dict[str, Any]:
+        """Send *command* with one addressing variant."""
+        cipher = self._gateway_cipher()
+        if variant == GATEWAY_VIA_UNIT:
+            return await self._gateway.request(
+                self._child_mac, cipher, {**command, "mac": self._child_mac}
+            )
+        if variant == GATEWAY_VIA_MODULE:
+            return await self._gateway.request(
+                self._parent_mac, cipher, {**command, "mac": self._child_mac}
+            )
+        if variant == GATEWAY_VIA_MODULE_AS_UNIT:
+            return await self._gateway.request(
+                self._parent_mac, cipher, {**command, "mac": self._child_mac}, tcid=self._child_mac
+            )
+        return await self._gateway.request(self._parent_mac, cipher, command)
+
     async def _gateway_request(self, command: Dict[str, Any]) -> Dict[str, Any]:
         """Send *command* through the legacy gateway.
 
-        Sub-devices of a commercial module carry the module MAC plus ``00`` as
-        their id. ``QueryOnline`` may list only the module as online; in that
-        case the request is addressed to the module (``tcid``) with the
-        sub-device named inside the encrypted pack (``mac``), the same way the
-        commercial MQTT path addresses indoor units (#33, #44). Whichever
-        target answered is remembered for the following requests.
+        A standalone module is addressed directly (its own gateway, its own
+        MAC in the envelope and in the pack, as the Gree+ app does). A unit
+        behind a module may be reachable through its own gateway entry, or
+        only through the module's, named in the envelope or inside the pack
+        (#6, #33, #44) -- the variants in _GATEWAY_SUB_DEVICE_VARIANTS are
+        tried once and the one that answers is kept for this unit and its
+        siblings. QueryOnline "offline" skips a variant without waiting.
         """
-        target = getattr(self, "_gateway_target", None)
-        if target != self._parent_mac:
+        variants = self._gateway_variants()
+        last_error: Optional[BaseException] = None
+        offline: set = set()
+        for variant in variants:
+            route = self._child_mac if variant == GATEWAY_VIA_UNIT else self._parent_mac
+            if route in offline:
+                continue
             try:
-                reply = await self._gateway.request(self._child_mac, self._gateway_cipher(), command)
-                self._gateway_target = self._child_mac
-                return reply
-            except DeviceOfflineError:
-                if self._parent_mac == self._child_mac:
-                    raise
-                _LOGGER.debug(
-                    f"{self.device_info.name}: {self._child_mac} is offline for QueryOnline, "
-                    f"retrying through module {self._parent_mac}"
-                )
-        try:
-            reply = await self._gateway.request(
-                self._parent_mac, self._gateway_cipher(), {**command, "mac": self._child_mac}
-            )
-        except DeviceOfflineError:
-            self._gateway_target = None
-            raise
-        self._gateway_target = self._parent_mac
-        return reply
+                reply = await self._gateway_send(variant, command)
+            except DeviceOfflineError as err:
+                last_error = err
+                offline.add(route)
+                _LOGGER.debug(f"{self.device_info.name}: gateway variant '{variant}': {route} offline for QueryOnline")
+                continue
+            except asyncio.TimeoutError as err:
+                last_error = err
+                _LOGGER.debug(f"{self.device_info.name}: gateway variant '{variant}': no answer")
+                continue
+            if self._gateway_variant != variant:
+                self._gateway_variant = variant
+                self._remember(gateway_variant=variant)
+                if self.is_sub_device:
+                    _LOGGER.info(
+                        f"{self.device_info.name}: reached through the gateway as '{variant}' "
+                        f"(module {self._parent_mac}, unit {self._child_mac}); keeping it"
+                    )
+            return reply
+        assert last_error is not None
+        raise last_error
 
     async def _gateway_status(self, command: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Fetch a status pack through the legacy gateway and decode it."""
@@ -578,17 +701,25 @@ class CloudDevice(Device):
         await self.send_command(opt, p)
     
     def _reply_is_for_other_unit(self, pack: Dict[str, Any]) -> bool:
-        """True when a decrypted pack names a different indoor unit.
+        """True when a decrypted pack names a different unit behind this module.
 
         Several units behind one module share the module's topics, so every
-        head receives every reply. A pack that carries ``sub``/``mac`` for
-        another unit must be ignored, or one head's state overwrites the
-        others (#6, #33). Packs without a unit id are accepted as before.
+        head receives every reply, and a pack carrying ``sub``/``mac`` for a
+        sibling must be ignored or one head's state overwrites the others
+        (#6, #33). Only ids of units actually instantiated behind the same
+        module count as "someone else": some modules put an internal id in
+        ``mac`` and the cloud MAC in ``cid`` (#66), and such packs are ours.
+        A ``cid`` equal to our MAC settles it outright.
         """
+        if pack.get('cid') in (self._child_mac, self._parent_mac):
+            return False
+        siblings = _UNITS_BY_MODULE.get(self._parent_mac, set()) - {self._child_mac}
+        if not siblings:
+            return False
         for key in _REPLY_UNIT_KEYS:
             unit = pack.get(key)
-            if isinstance(unit, str) and unit:
-                return unit not in (self._child_mac, self._parent_mac)
+            if isinstance(unit, str) and unit in siblings:
+                return True
         return False
 
     def _handle_mqtt_message(self, topic: str, message: MqttDeviceMessage) -> None:
@@ -637,6 +768,8 @@ class CloudDevice(Device):
         offset). Everything else passes through unchanged.
         """
         cleaned: Dict[str, Any] = {}
+        if 'hid' in kwargs and not isinstance(kwargs['hid'], str):
+            kwargs.pop('hid')  # some modules echo a number where the firmware string belongs
         for key, value in kwargs.items():
             if isinstance(value, str):
                 text = value.strip()
@@ -662,6 +795,7 @@ class CloudDevice(Device):
 
     async def close(self):
         """Close device and cleanup resources"""
+        _UNITS_BY_MODULE.get(self._parent_mac, set()).discard(self._child_mac)
         try:
             if self._mqtt_client is not None:
                 # Unsubscribe from MQTT topics
@@ -684,4 +818,5 @@ class CloudDevice(Device):
                 f"parent_mac={self._parent_mac}, "
                 f"child_mac={self._child_mac}, "
                 f"addressing={self._addressing}, "
+                f"gateway_variant={self._gateway_variant}, "
                 f"transport={self.transport})")
