@@ -447,10 +447,13 @@ async def test_gateway_sub_device_falls_back_to_module_when_child_offline():
 
         assert device.raw_properties["SetTem"] == 22
         assert [c.args[0] for c in api.query_online.await_args_list] == [[CHILD_MAC], [PARENT_MAC]]
-        assert [r["tcid"] for r in srv.received] == [PARENT_MAC, PARENT_MAC]
-        status = cipher.decrypt(srv.received[0]["pack"])
+        # first-contact probe, the full status, then the command -- all through the module
+        assert [r["tcid"] for r in srv.received] == [PARENT_MAC, PARENT_MAC, PARENT_MAC]
+        probe = cipher.decrypt(srv.received[0]["pack"])
+        assert probe["t"] == "status" and probe["mac"] == CHILD_MAC and len(probe["cols"]) == 5
+        status = cipher.decrypt(srv.received[1]["pack"])
         assert status["t"] == "status" and status["mac"] == CHILD_MAC
-        cmd = cipher.decrypt(srv.received[1]["pack"])
+        cmd = cipher.decrypt(srv.received[2]["pack"])
         assert cmd == {"t": "cmd", "opt": ["Pow"], "p": [0], "mac": CHILD_MAC}
 
 
