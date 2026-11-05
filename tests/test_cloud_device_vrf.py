@@ -332,11 +332,6 @@ def make_gateway(offline=True):
     return gw
 
 
-def test_sub_device_with_old_version_string_starts_on_mqtt():
-    """#6: heads report the module's 'V1.1.0.0'; that must not force the gateway."""
-    mqtt = MagicMock()
-    head = make_head(HEAD_A, mqtt, gateway=make_gateway())
-    assert head.transport == "mqtt"
 
 
 def test_standalone_old_module_still_starts_on_gateway():
@@ -353,13 +348,14 @@ async def test_bind_falls_back_to_gateway_when_mqtt_is_silent_and_back_when_both
     mqtt.unsubscribe_from_device = AsyncMock()
     head = make_head(HEAD_A, mqtt, gateway=make_gateway())  # gateway: offline -> TimeoutError subclass
 
+    assert head.transport == "gateway"
     with pytest.raises(asyncio.TimeoutError):
         await head.bind()
 
-    # tried MQTT (both addressings), then the gateway, then restored MQTT
+    # gateway first (offline), then MQTT (both addressings), then restored gateway
     assert mqtt.publish_command.await_count == 2
-    assert head.transport == "mqtt"
-    mqtt.unsubscribe_from_device.assert_not_awaited()
+    assert head.transport == "gateway"
+    mqtt.unsubscribe_from_device.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -473,15 +469,15 @@ async def test_sub_device_finds_the_variant_and_chunks_columns_then_siblings_ski
 
         assert set(cols) <= set(data)  # plus the five probe columns
         assert head_a._gateway_variant == "module-as-unit"
-        assert head_a._gateway_cols_limit == 16
+        assert head_a._gateway_cols_limit == 5
         # first contact: 5-col probe through the variants (module silent, module-as-unit
         # answers); then the 35 remaining columns in one go (silent: too long) and in
-        # 3 chunks of <=16
+        # 7 chunks of 5
         tcids = [t for t, _ in srv.received]
         assert tcids[-3:] == [HEAD_A, HEAD_A, HEAD_A]
         answered = [inner for t, inner in srv.received if t == HEAD_A and len(inner["cols"]) <= 16]
-        assert len(answered) == 4  # probe + 3 chunks
-        assert _cd._MODULE_HINTS[MODULE] == {"gateway_variant": "module-as-unit", "gateway_cols_limit": 16}
+        assert len(answered) == 9  # probe + 40 columns in chunks of 5 (the probe names are not in cols)
+        assert _cd._MODULE_HINTS[MODULE] == {"gateway_variant": "module-as-unit", "gateway_cols_limit": 5}
 
         # A sibling created afterwards uses the learned variant and limit straight away.
         srv.received.clear()
@@ -490,7 +486,7 @@ async def test_sub_device_finds_the_variant_and_chunks_columns_then_siblings_ski
         data_b = await head_b.request_status(cols)
         assert set(cols) <= set(data_b)  # plus the probe columns
         assert all(t == HEAD_B and len(inner["cols"]) <= 16 for t, inner in srv.received)
-        assert len(srv.received) == 1 + 3  # first-contact probe, then 35 columns in chunks of 16
+        assert len(srv.received) == 1 + 7  # first-contact probe, then 35 columns in chunks of 5
 
         # Commands follow the learned variant.
         srv.received.clear()
@@ -506,14 +502,14 @@ async def test_bind_remembers_transport_for_siblings():
     async with PickyModuleGateway(cipher) as srv:
         gw = GreeCloudGateway(_module_only_api(srv.port), timeout=0.3)
         mqtt = MagicMock(); mqtt.publish_command = AsyncMock(); mqtt.subscribe_to_device = AsyncMock(); mqtt.unsubscribe_from_device = AsyncMock()
-        head_a = CloudDevice(mqtt, DeviceInfo("0.0.0.0", 0, HEAD_A, "A", version="V1.1.0.0"),
+        head_a = CloudDevice(mqtt, DeviceInfo("0.0.0.0", 0, HEAD_A, "A", version="V3.5.M"),
                              device_key=KEY, gateway=gw, parent_mac=MODULE, command_timeout=0.1)
         assert head_a.transport == "mqtt"
         await head_a.bind()
         assert head_a.transport == "gateway"
         assert _cd._MODULE_HINTS[MODULE]["transport"] == "gateway"
 
-        head_b = CloudDevice(mqtt, DeviceInfo("0.0.0.0", 0, HEAD_B, "B", version="V1.1.0.0"),
+        head_b = CloudDevice(mqtt, DeviceInfo("0.0.0.0", 0, HEAD_B, "B", version="V3.5.M"),
                              device_key=KEY, gateway=gw, parent_mac=MODULE, command_timeout=0.1)
         assert head_b.transport == "gateway"
         published = mqtt.publish_command.await_count
@@ -620,6 +616,7 @@ async def test_concurrent_heads_are_serialised_per_module_and_chunks_shrink_on_f
     async with FlakyModuleGateway(cipher, max_cols=16, fail_sizes_once={16}) as srv:
         gw = GreeCloudGateway(_module_only_api(srv.port), timeout=0.3)
         _cd.GATEWAY_REQUEST_SPACING = 0.01
+        _cd.GATEWAY_COLS_CHUNK = 16  # a module that takes bigger chunks; restored by the fixture
         heads = [CloudDevice(None, DeviceInfo("0.0.0.0", 0, m, m[:4], version="V1.1.0.0"),
                              device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
                  for m in (HEAD_A, HEAD_B, "c14d9403500000", "49ad0b24890000")]
@@ -701,12 +698,12 @@ async def test_first_head_probes_first_and_siblings_probe_before_chunks():
         srv.received.clear()
         head_b = CloudDevice(None, DeviceInfo("0.0.0.0", 0, HEAD_B, "B", version="V1.1.0.0"),
                              device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
-        assert head_b._gateway_cols_limit == 16 and head_b._gateway_variant == "module"
+        assert head_b._gateway_cols_limit == 5 and head_b._gateway_variant == "module"
         data_b = await head_b.request_status(cols)
         assert set(cols) <= set(data_b)
         sizes = [len(inner["cols"]) for t, inner in srv.received]
         assert sizes[0] == 5 and all(n <= 16 for n in sizes)
-        assert len(srv.received) == 1 + 3  # probe + 35 remaining in chunks of 16
+        assert len(srv.received) == 1 + 8  # first-contact probe, then the 40 columns in chunks of 5
 
 
 @pytest.mark.asyncio
@@ -721,3 +718,51 @@ async def test_no_cross_transport_fallback_when_module_transport_is_known():
     with pytest.raises(asyncio.TimeoutError):
         await head.bind()
     mqtt.publish_command.assert_not_awaited()
+
+
+# ------------------------------------------------- offline backoff / order ---
+
+class OfflineModuleGateway(PickyModuleGateway):
+    """Answers every request with the gateway's 'device is not online' pack."""
+
+    async def handle(self, reader, writer):
+        line = await reader.readline()
+        outer = _json.loads(line)
+        self.received.append((outer["tcid"], self.cipher.decrypt(outer["pack"])))
+        pack, _ = self.cipher.encrypt({"t": "res", "r": 404, "msg": "device is not online"})
+        writer.write(_json.dumps({"t": "pack", "pack": pack, "tcid": "app"}).encode() + b"\n")
+        await writer.drain()
+        writer.close()
+
+
+@pytest.mark.asyncio
+async def test_not_online_reply_backs_off_for_the_whole_module(caplog):
+    import logging
+    cipher = CipherV1(KEY.encode())
+    async with OfflineModuleGateway(cipher) as srv:
+        gw = GreeCloudGateway(_module_only_api(srv.port), timeout=0.3)
+        _cd.GATEWAY_REQUEST_SPACING = 0.01
+        head_a = CloudDevice(None, DeviceInfo("0.0.0.0", 0, HEAD_A, "A", version="V1.1.0.0"),
+                             device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
+        head_b = CloudDevice(None, DeviceInfo("0.0.0.0", 0, HEAD_B, "B", version="V1.1.0.0"),
+                             device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
+        with caplog.at_level(logging.WARNING, logger="greeclimate_davo22.cloud_device"):
+            with pytest.raises(asyncio.TimeoutError):
+                await head_a.request_status(["Pow"])
+        sent = len(srv.received)
+        assert sent >= 1 and "reports module" in caplog.text
+        # the sibling fails fast without touching the gateway
+        with pytest.raises(asyncio.TimeoutError):
+            await head_b.request_status(["Pow"])
+        assert len(srv.received) == sent
+        assert MODULE in _cd._MODULE_GATEWAY_OFFLINE_UNTIL
+
+
+def test_old_sub_device_starts_on_the_gateway_again():
+    mqtt = MagicMock()
+    head = make_head(HEAD_A, mqtt, gateway=make_gateway())
+    assert head.transport == "gateway"
+
+
+def test_chunk_default_is_probe_size():
+    assert _cd.GATEWAY_COLS_CHUNK == 5
