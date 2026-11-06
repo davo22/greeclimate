@@ -61,6 +61,20 @@ _GATEWAY_SUB_DEVICE_VARIANTS = (
     GATEWAY_MODULE_PLAIN,
 )
 
+# Commands to a unit behind a module. The controller in #6 answers status with
+# the unit named as "mac" but stays silent on commands shaped the same way.
+# "sub" is what the LAN protocol uses for commands to sub-units, so it goes
+# first. Field names only: which module/gateway to use comes from the status
+# variant. (tcid, field(s) in the pack), tried once, the one acknowledged is kept.
+_GATEWAY_COMMAND_VARIANTS = (
+    ("sub", "module", ("sub",)),
+    ("sub+mac", "module", ("sub", "mac")),
+    ("tcid-unit", "unit", ()),
+    ("tcid-unit+sub", "unit", ("sub",)),
+    ("mac", "module", ("mac",)),
+)
+GATEWAY_COMMAND_TIMEOUT = 4.0  # per variant; a silent one must not stall a poll for long
+
 # Short status request used to find out whether a module answers at all; old
 # controllers on the line protocol may drop the ~80-column request (#6).
 GATEWAY_PROBE_COLS = ["Pow", "Mod", "SetTem", "TemSen", "WdSpd"]
@@ -188,6 +202,7 @@ class CloudDevice(Device):
         # Legacy gateway: addressing variant and column limit, learned on the
         # first exchange (or taken from a sibling behind the same module).
         hints = _MODULE_HINTS.get(self._parent_mac, {})
+        self._gateway_command_variant: Optional[str] = hints.get("gateway_command_variant")
         self._gateway_variant: Optional[str] = hints.get("gateway_variant")
         self._gateway_cols_limit: Optional[int] = hints.get("gateway_cols_limit")
         # True once this unit got any gateway reply. A unit's first contact
@@ -642,6 +657,8 @@ class CloudDevice(Device):
     async def _gateway_send_variant(self, variant: str, command: Dict[str, Any]) -> Dict[str, Any]:
         """Send *command* with one addressing variant."""
         cipher = self._gateway_cipher()
+        if command.get('t') == 'cmd':
+            return await self._gateway_send_command(variant, command, cipher)
         if variant == GATEWAY_VIA_UNIT:
             return await self._gateway.request(
                 self._child_mac, cipher, {**command, "mac": self._child_mac}
@@ -656,17 +673,82 @@ class CloudDevice(Device):
             )
         return await self._gateway.request(self._parent_mac, cipher, command)
 
+    async def _gateway_send_command(
+        self, variant: str, command: Dict[str, Any], cipher: CipherV1
+    ) -> Dict[str, Any]:
+        """Send a ``cmd`` pack; *variant* is one of _GATEWAY_COMMAND_VARIANTS or plain.
+
+        A standalone module gets the bare pack, as the reference client sends
+        it: only its status packs carry ``mac``.
+        """
+        spec = next((v for v in _GATEWAY_COMMAND_VARIANTS if v[0] == variant), None)
+        if spec is None:
+            return await self._gateway.request(self._child_mac, cipher, command)
+        _, tcid_is, fields = spec
+        pack = {**command, **{field: self._child_mac for field in fields}}
+        route = self._child_mac if self._gateway_variant == GATEWAY_VIA_UNIT else self._parent_mac
+        return await self._gateway.request(
+            route,
+            cipher,
+            pack,
+            tcid=self._child_mac if tcid_is == "unit" else self._parent_mac,
+            timeout=GATEWAY_COMMAND_TIMEOUT,
+        )
+
+    async def _gateway_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        """Send a command to a unit behind a module, finding the shape it accepts.
+
+        Values are absolute, so repeating one under another variant is safe.
+        Only an acknowledgement with ``r`` 200 counts: a unit that answers
+        with an error is treated like a silent one and the next shape is
+        tried. The first shape acknowledged is kept for the siblings too.
+        """
+        learned = self._gateway_command_variant or _MODULE_HINTS.get(self._parent_mac, {}).get(
+            "gateway_command_variant"
+        )
+        names = [learned] if learned else [v[0] for v in _GATEWAY_COMMAND_VARIANTS]
+        last_error: Optional[BaseException] = None
+        for name in names:
+            try:
+                reply = await self._gateway_send(name, command)
+            except DeviceOfflineError:
+                raise
+            except asyncio.TimeoutError as err:
+                last_error = err
+                _LOGGER.debug(f"{self.device_info.name}: command shape '{name}': no answer")
+                continue
+            if isinstance(reply, dict) and reply.get('r') == 200:
+                if name != self._gateway_command_variant:
+                    self._gateway_command_variant = name
+                    self._remember(gateway_command_variant=name)
+                    _LOGGER.info(
+                        f"{self.device_info.name}: commands accepted as '{name}' "
+                        f"(module {self._parent_mac}, unit {self._child_mac}); keeping it"
+                    )
+                return reply
+            _LOGGER.warning(f"{self.device_info.name}: command shape '{name}' answered: {reply}")
+            last_error = asyncio.TimeoutError(f"{self.device_info.name}: command rejected: {reply}")
+        assert last_error is not None
+        _LOGGER.warning(
+            f"{self.device_info.name}: no command shape was acknowledged by module {self._parent_mac}"
+        )
+        raise last_error
+
     async def _gateway_request(self, command: Dict[str, Any]) -> Dict[str, Any]:
         """Send *command* through the legacy gateway.
 
-        A standalone module is addressed directly (its own gateway, its own
-        MAC in the envelope and in the pack, as the Gree+ app does). A unit
+        A standalone module is addressed directly: its own gateway and its
+        own MAC in the envelope; status packs also carry ``mac``, commands do
+        not (as in the reference client). A unit
         behind a module may be reachable through its own gateway entry, or
         only through the module's, named in the envelope or inside the pack
         (#6, #33, #44) -- the variants in _GATEWAY_SUB_DEVICE_VARIANTS are
         tried once and the one that answers is kept for this unit and its
         siblings. QueryOnline "offline" skips a variant without waiting.
+        Commands to such a unit have their own search, see _gateway_command.
         """
+        if command.get('t') == 'cmd' and self.is_sub_device:
+            return await self._gateway_command(command)
         variants = self._gateway_variants()
         last_error: Optional[BaseException] = None
         offline: set = set()
