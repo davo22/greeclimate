@@ -434,7 +434,7 @@ class PickyModuleGateway:
             writer.write(_json.dumps({"t": "pack", "pack": pack, "tcid": "app"}).encode() + b"\n")
             await writer.drain()
         elif inner.get("t") == "cmd" and ok_tcid and unit:
-            pack, _ = self.cipher.encrypt({"t": "res", "r": 200, "sub": unit, "opt": inner["opt"], "p": inner["p"]})
+            pack, _ = self.cipher.encrypt({"t": "res", "r": 200, "opt": inner["opt"], "p": inner["p"]})
             writer.write(_json.dumps({"t": "pack", "pack": pack, "tcid": "app"}).encode() + b"\n")
             await writer.drain()
         # otherwise: stay silent, like the real thing
@@ -490,9 +490,13 @@ async def test_sub_device_finds_the_variant_and_chunks_columns_then_siblings_ski
 
         # Commands follow the learned variant.
         srv.received.clear()
+        _cd.GATEWAY_COMMAND_TIMEOUT = 0.05
         head_b.power = True
-        await head_b.push_state_update()
-        assert srv.received[0][0] == HEAD_B and srv.received[0][1]["mac"] == HEAD_B
+        # this fake acks only a pack with mac and tcid == mac, a shape we do not send:
+        # all five are tried, and on the gateway a missing ack is a real failure
+        with pytest.raises(asyncio.TimeoutError):
+            await head_b.push_state_update()
+        assert [inner.get("opt") for _, inner in srv.received] == [["Pow"]] * 5
 
 
 @pytest.mark.asyncio
@@ -766,3 +770,117 @@ def test_old_sub_device_starts_on_the_gateway_again():
 
 def test_chunk_default_is_probe_size():
     assert _cd.GATEWAY_COLS_CHUNK == 5
+
+
+# -------------------------------------------------------- command shapes ---
+
+class CommandShapeGateway(PickyModuleGateway):
+    """Answers status with mac; commands only when the pack names the unit as `sub`,
+    silently ignores any other shape (what we expect of the controller in #6)."""
+
+    def __init__(self, cipher, accept):
+        super().__init__(cipher, max_cols=5, want_tcid="module")
+        self.accept = accept  # (tcid, inner) -> bool
+
+    async def handle(self, reader, writer):
+        line = await reader.readline()
+        outer = _json.loads(line)
+        inner = self.cipher.decrypt(outer["pack"])
+        self.received.append((outer["tcid"], inner))
+        if inner.get("t") == "status":
+            reply = {"t": "dat", "r": 200, "mac": inner.get("mac"), "cols": inner["cols"], "dat": [1] * len(inner["cols"])}
+        elif self.accept(outer["tcid"], inner):
+            reply = {"t": "res", "r": 200, "opt": inner["opt"], "p": inner["p"]}
+        else:
+            writer.close()
+            return
+        pack, _ = self.cipher.encrypt(reply)
+        writer.write(_json.dumps({"t": "pack", "pack": pack, "tcid": "app"}).encode() + b"\n")
+        await writer.drain()
+        writer.close()
+
+
+def _gateway_head(gw, mac=HEAD_A):
+    return CloudDevice(None, DeviceInfo("0.0.0.0", 0, mac, mac[:4], version="V1.1.0.0"),
+                       device_key=KEY, gateway=gw, parent_mac=MODULE, transport="gateway")
+
+
+@pytest.mark.asyncio
+async def test_command_to_sub_device_uses_sub_first_and_the_shape_is_shared():
+    cipher = CipherV1(KEY.encode())
+    async with CommandShapeGateway(cipher, lambda tcid, inner: "sub" in inner) as srv:
+        gw = GreeCloudGateway(_module_only_api(srv.port), timeout=0.3)
+        _cd.GATEWAY_REQUEST_SPACING = 0.01
+        head_a = _gateway_head(gw)
+        await head_a.request_status(["Pow"])
+
+        reply = await head_a.send_command(["SetTem"], [21], strict_ack=True)
+
+        assert reply["r"] == 200
+        tcid, cmd = srv.received[-1]
+        assert tcid == MODULE and cmd == {"t": "cmd", "opt": ["SetTem"], "p": [21], "sub": HEAD_A}
+        assert _cd._MODULE_HINTS[MODULE]["gateway_command_variant"] == "sub"
+
+        head_b = _gateway_head(gw, HEAD_B)
+        await head_b.request_status(["Pow"])
+        srv.received.clear()
+        await head_b.send_command(["Pow"], [0], strict_ack=True)
+        assert len(srv.received) == 1 and srv.received[0][1]["sub"] == HEAD_B
+
+
+@pytest.mark.asyncio
+async def test_command_search_moves_on_from_silent_shapes():
+    cipher = CipherV1(KEY.encode())
+    _cd.GATEWAY_COMMAND_TIMEOUT = 0.05
+    async with CommandShapeGateway(cipher, lambda tcid, inner: tcid == HEAD_A and "sub" not in inner) as srv:
+        gw = GreeCloudGateway(_module_only_api(srv.port), timeout=0.3)
+        _cd.GATEWAY_REQUEST_SPACING = 0.01
+        head = _gateway_head(gw)
+        await head.request_status(["Pow"])
+        await head.send_command(["Pow"], [1], strict_ack=True)
+        assert head._gateway_command_variant == "tcid-unit"
+        assert srv.received[-1] == (HEAD_A, {"t": "cmd", "opt": ["Pow"], "p": [1]})
+
+
+@pytest.mark.asyncio
+async def test_error_reply_is_not_learned_as_a_working_shape():
+    cipher = CipherV1(KEY.encode())
+    _cd.GATEWAY_COMMAND_TIMEOUT = 0.05
+
+    class Rejecting(CommandShapeGateway):
+        async def handle(self, reader, writer):
+            line = await reader.readline()
+            outer = _json.loads(line)
+            inner = self.cipher.decrypt(outer["pack"])
+            self.received.append((outer["tcid"], inner))
+            r = 200 if inner.get("t") == "status" else 500
+            body = {"t": "dat", "r": 200, "mac": inner.get("mac"), "cols": inner.get("cols"), "dat": [1] * len(inner.get("cols", []))} if r == 200 else {"t": "res", "r": 500}
+            pack, _ = self.cipher.encrypt(body)
+            writer.write(_json.dumps({"t": "pack", "pack": pack, "tcid": "app"}).encode() + b"\n")
+            await writer.drain()
+            writer.close()
+
+    async with Rejecting(cipher, lambda *_: False) as srv:
+        gw = GreeCloudGateway(_module_only_api(srv.port), timeout=0.3)
+        _cd.GATEWAY_REQUEST_SPACING = 0.01
+        head = _gateway_head(gw)
+        await head.request_status(["Pow"])
+        with pytest.raises(asyncio.TimeoutError):
+            await head.send_command(["Pow"], [1], strict_ack=True)
+        assert head._gateway_command_variant is None
+        assert "gateway_command_variant" not in _cd._MODULE_HINTS[MODULE]
+
+
+@pytest.mark.asyncio
+async def test_standalone_module_commands_are_bare_status_carries_mac():
+    cipher = CipherV1(KEY.encode())
+    async with CommandShapeGateway(cipher, lambda tcid, inner: True) as srv:
+        mac = "c03937a426d8"
+        api = MagicMock(); api.user_id = 1
+        api.query_online = AsyncMock(return_value={mac: CloudDeviceServer("127.0.0.1", srv.port, ssl=False)})
+        gw = GreeCloudGateway(api, timeout=0.3)
+        unit = CloudDevice(None, DeviceInfo("0.0.0.0", 0, mac, "split", version="V2.0.0"), device_key=KEY, gateway=gw)
+        await unit.request_status(["Pow"])
+        await unit.send_command(["Pow"], [1], strict_ack=True)
+        assert srv.received[0][1]["mac"] == mac
+        assert srv.received[1] == (mac, {"t": "cmd", "opt": ["Pow"], "p": [1]})

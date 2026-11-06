@@ -159,7 +159,12 @@ class GreeCloudGateway:
         return cipher.decrypt(outer["pack"])
 
     async def request(
-        self, mac: str, cipher: CipherV1, command: Dict[str, Any], tcid: Optional[str] = None
+        self,
+        mac: str,
+        cipher: CipherV1,
+        command: Dict[str, Any],
+        tcid: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send one command to the device and return the decrypted reply.
 
@@ -168,6 +173,7 @@ class GreeCloudGateway:
         Raises asyncio.TimeoutError (or DeviceOfflineError) when the device
         cannot be reached or does not answer within the timeout.
         """
+        timeout = self._timeout if timeout is None else timeout
         server = await self.server_for(mac)
         payload = self.build_envelope(tcid or mac, cipher, command)
         _LOGGER.debug(
@@ -183,7 +189,7 @@ class GreeCloudGateway:
                     server.port,
                     ssl=self._tls_context if server.ssl else None,
                 ),
-                timeout=self._timeout,
+                timeout=timeout,
             )
         except (OSError, asyncio.TimeoutError) as err:
             # The device may have moved to another gateway; re-resolve next time.
@@ -195,7 +201,7 @@ class GreeCloudGateway:
         try:
             writer.write(payload)
             await writer.drain()
-            line = await asyncio.wait_for(reader.readline(), timeout=self._timeout)
+            line = await asyncio.wait_for(reader.readline(), timeout=timeout)
         finally:
             writer.close()
             try:

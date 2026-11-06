@@ -317,8 +317,8 @@ async def test_gateway_device_push_state_sends_cmd():
         await device.push_state_update()
 
         cmd = cipher.decrypt(srv.received[0]["pack"])
-        # The pack names the unit, as the Gree+ app does on this protocol.
-        assert cmd == {"t": "cmd", "opt": ["Pow"], "p": [1], "mac": MAC}
+        # Bare pack, as in the reference client: only status packs carry mac.
+        assert cmd == {"t": "cmd", "opt": ["Pow"], "p": [1]}
         assert srv.received[0]["tcid"] == MAC
         assert device._dirty == []
 
@@ -434,7 +434,7 @@ async def test_gateway_sub_device_falls_back_to_module_when_child_offline():
     """A `...00` indoor unit that QueryOnline reports offline is reached through
     its module: tcid = module MAC, sub-device named inside the pack (#44)."""
     cipher = CipherV1(KEY.encode())
-    async with FakeGatewayServer(cipher, reply={"t": "dat", "cols": ["Pow", "SetTem"], "dat": [1, 22]}) as srv:
+    async with FakeGatewayServer(cipher, reply={"t": "dat", "r": 200, "cols": ["Pow", "SetTem"], "dat": [1, 22]}) as srv:
         api = make_api()
         server = CloudDeviceServer("127.0.0.1", srv.port, ssl=False)
         api.query_online.side_effect = lambda macs: {PARENT_MAC: server} if macs == [PARENT_MAC] else {}
@@ -454,7 +454,7 @@ async def test_gateway_sub_device_falls_back_to_module_when_child_offline():
         status = cipher.decrypt(srv.received[1]["pack"])
         assert status["t"] == "status" and status["mac"] == CHILD_MAC
         cmd = cipher.decrypt(srv.received[2]["pack"])
-        assert cmd == {"t": "cmd", "opt": ["Pow"], "p": [0], "mac": CHILD_MAC}
+        assert cmd == {"t": "cmd", "opt": ["Pow"], "p": [0], "sub": CHILD_MAC}
 
 
 @pytest.mark.asyncio
