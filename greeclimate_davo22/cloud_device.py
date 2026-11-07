@@ -547,6 +547,14 @@ class CloudDevice(Device):
             data = self._status_data(reply)
             self._gateway_warm = True
             rest = [c for c in cols if c not in GATEWAY_PROBE_COLS]
+        if limit is None and self.is_sub_device:
+            # Never send a long request to a unit behind a module: the #6
+            # controller goes silent for almost a minute after one, for every
+            # unit behind it. Chunks cost a few seconds per poll instead.
+            hinted = _MODULE_HINTS.get(self._parent_mac, {}).get("gateway_cols_limit")
+            limit = min(GATEWAY_COLS_CHUNK, hinted) if hinted else GATEWAY_COLS_CHUNK
+            self._gateway_cols_limit = limit
+            self._remember(gateway_cols_limit=limit)
         if limit is None:
             try:
                 reply = await self._gateway_request({'t': 'status', 'cols': rest})

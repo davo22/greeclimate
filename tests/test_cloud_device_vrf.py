@@ -471,8 +471,8 @@ async def test_sub_device_finds_the_variant_and_chunks_columns_then_siblings_ski
         assert head_a._gateway_variant == "module-as-unit"
         assert head_a._gateway_cols_limit == 5
         # first contact: 5-col probe through the variants (module silent, module-as-unit
-        # answers); then the 35 remaining columns in one go (silent: too long) and in
-        # 7 chunks of 5
+        # answers); then the columns in chunks of 5, never one long request
+        assert max(len(inner["cols"]) for _, inner in srv.received) == 5
         tcids = [t for t, _ in srv.received]
         assert tcids[-3:] == [HEAD_A, HEAD_A, HEAD_A]
         answered = [inner for t, inner in srv.received if t == HEAD_A and len(inner["cols"]) <= 16]
