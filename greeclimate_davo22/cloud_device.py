@@ -428,11 +428,24 @@ class CloudDevice(Device):
         if data:
             return data
         if reply:
-            _LOGGER.warning(
-                f"{self.device_info.name}: status request answered with a "
-                f"{reply.get('t', '?')!r} pack instead of data: "
-                f"{ {k: v for k, v in reply.items() if k != 'pack'} }"
-            )
+            fields = {k: v for k, v in reply.items() if k != 'pack'}
+            if reply.get('t') == 'dat':
+                kind = "empty"
+                message = f"{self.device_info.name}: status request answered with no properties: {fields}"
+            else:
+                kind = f"{reply.get('t')}:{reply.get('r')}"
+                message = (
+                    f"{self.device_info.name}: status request answered with a "
+                    f"{reply.get('t', '?')!r} pack instead of data: {fields}"
+                )
+            # Once per unit and kind of reply at WARNING, then DEBUG: a unit
+            # that always answers this way must not flood the log (#73).
+            warned = self.__dict__.setdefault("_status_reply_warned", set())
+            if kind in warned:
+                _LOGGER.debug(message)
+            else:
+                warned.add(kind)
+                _LOGGER.warning(message + " (further replies like this are logged at debug level)")
         return {}
 
     async def send_command(

@@ -884,3 +884,27 @@ async def test_standalone_module_commands_are_bare_status_carries_mac():
         await unit.send_command(["Pow"], [1], strict_ack=True)
         assert srv.received[0][1]["mac"] == mac
         assert srv.received[1] == (mac, {"t": "cmd", "opt": ["Pow"], "p": [1]})
+
+
+# ------------------------------------------------------- #73 empty replies ---
+
+@pytest.mark.asyncio
+async def test_empty_dat_reply_is_named_as_such_and_warned_once(caplog):
+    import logging
+    mqtt = MagicMock()
+    head = make_head(HEAD_A, mqtt)
+    cipher = CipherV1(KEY.encode())
+
+    async def publish(parent_mac, command, dev_cipher, tcid=None):
+        pack, _ = cipher.encrypt({"t": "dat", "mac": HEAD_A, "r": 200, "cols": [], "dat": []})
+        msg = MagicMock(); msg.pack = pack
+        head._handle_mqtt_message(f"response/{parent_mac}/app", msg)
+    mqtt.publish_command = AsyncMock(side_effect=publish)
+
+    with caplog.at_level(logging.DEBUG, logger="greeclimate_davo22.cloud_device"):
+        for _ in range(3):
+            assert await head.request_status(["Pow"]) == {}
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "no properties" in r.getMessage()]
+    debugs = [r for r in caplog.records if r.levelno == logging.DEBUG and "no properties" in r.getMessage()]
+    assert len(warnings) == 1 and len(debugs) == 2
+    assert "instead of data" not in caplog.text
